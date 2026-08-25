@@ -42,7 +42,12 @@ It reads images from `$GU_INPUT_DIR` and writes landmark predictions to
 
 `docker/fubio/` is a byte-identical inference-only subset of `src/fubio/` — the
 Dockerfile copies the 28 modules inference needs so the image carries no
-training code.
+training code. Two lazy imports inside that subset (`fubio.data.build_cache` in
+`data/manifest.py`, `fubio.train.module` in `serving/predict.py`) therefore do
+not resolve inside the image. Both sit on branches the container never
+executes — the memmap cache path and `load_model()`, neither of which
+`model.py` calls — so the image runs correctly. They are left in place because
+this directory is the artifact that was graded, and it is shipped unedited.
 
 ## Training
 
