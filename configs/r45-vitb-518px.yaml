@@ -1,0 +1,118 @@
+# R45 — ViT-B @ 518px, flip-no-swap, geo constraints, 150ep.
+#
+# ── The question ────────────────────────────────────────────────────────────
+# R15 (ViT-B, online 29.42) is still best. Can we combine its backbone
+# strength with R43's feature-learning philosophy (no-swap flip, geo
+# constraints) and the current architecture upgrades (c2f, geo_simcc)?
+#
+# ── Key choices ─────────────────────────────────────────────────────────────
+# Backbone: ViT-B/14 (R15 proven, 86.6M params)
+# LR: R15 base × 2 for BS=24 (linear scaling from R15 BS=12)
+# Flip: 0.25/0.25, no swap, close at ep140 (late close for feature learning)
+# Mosaic: close at ep130 (20ep single-image → 10ep clean)
+# Schedule: 150ep, eta_min=0.05, warmup=1000 steps
+# freeze_epochs=0: pure LLRD like R15
+
+d_model: 512
+
+backbone:
+  name: dinov2_vitb14
+  pretrained: true
+  input_size: 518
+  freeze_epochs: 0
+
+neck:
+  mode: c2f
+  layer_indices: [2, 5, 8, 11]
+  n_bottleneck: 2
+
+neck_dropout: 0.1
+
+decoder:
+  n_layers: 3
+  n_heads: 8
+  ffn_dim: 4096
+  dropout: 0.1
+
+head:
+  n_layers: 1
+  ffn_dim: 2048
+  n_inst: 1
+  dropout: 0.1
+  derive_bbox: true
+  use_affine: false
+  coord:
+    mode: geo_simcc
+    tau: 1.0
+    window_cells: 1.0
+    n_offset_bins: 32
+    coarse_sigma_cells: 1.0
+    shape_weight: 0.5
+    d_local: 64
+
+matcher:
+  cost_conf: 1.0
+  cost_box: 5.0
+  cost_ciou: 2.0
+  cost_land: 10.0
+
+optimizer:
+  lr_backbone: 1.0e-5
+  lr_neck: 1.0e-4
+  lr_decoder: 1.0e-4
+  lr_heads: 1.0e-3
+  weight_decay: 0.05
+  warmup_steps: 1000
+  max_epochs: 150
+  eta_min_ratio: 0.05
+  layer_decay: 0.75
+
+loss:
+  lambda_bbox: 1.0
+  lambda_conf: 1.0
+  lambda_conf_rank: 0.0
+  lambda_land: 5.0
+  lambda_param: 2.0
+  landmark_beta: 0.0
+  lambda_simcc: 0.0
+  lambda_heatmap: 1.0
+  neg_label_smooth: 0.05
+  lambda_shape_consistency: 0.01
+  lambda_ortho: 0.0
+  lambda_repulsion: 0.0
+  lambda_supportive: 0.0
+  lambda_evidence: 0.0
+  lambda_geo_consistency: 0.5
+  lambda_geo_constraint: 0.5
+  shape_prior_path: data/shape_prior_v4.json
+
+miro:
+  lambda_miro: 0.0
+
+swad:
+  enabled: false
+
+data:
+  batch_size: 24
+  num_workers: 10
+  limit_train_batches: null
+  transform:
+    target_size: [518, 518]
+    rotation_range: 30.0
+    scale_range: [0.75, 1.25]
+    translate_range: 58.0
+    brightness_limit: 0.25
+    contrast_limit: 0.25
+    hflip_prob: 0.25
+    vflip_prob: 0.25
+  mosaic:
+    prob: 0.5
+    mode: distinct_task
+    close_epoch: 130
+  flip_close_epoch: 140
+
+logging:
+  project: fubio
+
+seed: 42
+precision: bf16-mixed

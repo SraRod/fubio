@@ -1,0 +1,159 @@
+# R47-semi — EMA Teacher + Pseudo-label semi-supervised.
+#
+# ── The question ────────────────────────────────────────────────────────────
+# Supervised plateau at ~29 MRE online. Can EMA Teacher pseudo-labeling on
+# 191K unlabeled images break through? R22 (equivariance-only) failed at
+# 55-85px due to prior/heatmap shortcuts. This uses teacher pseudo-landmarks
+# as direct localization targets instead.
+#
+# ── Init checkpoint ─────────────────────────────────────────────────────────
+# R47-head-tune (bl9uozhp): surgical fix for IVC/PSAX reinit + A4C angle
+# refinement from R45 base. val_mre=17.52, worst_task=44.39.
+# All 9 tasks balanced — no catastrophic task to poison pseudo-labels.
+#   --init-weights wandb_logs/fubio/bl9uozhp/checkpoints/fubio-epoch=049-val_mre_overall=17.519.ckpt
+#
+# ── Architecture ────────────────────────────────────────────────────────────
+# Same as R45/R47 (ViT-B/14 518px, geo_simcc, geo constraints).
+# NO head_tune block — all 9 tasks train from pseudo-labels.
+#
+# ── Semi-supervised design ──────────────────────────────────────────────────
+# Teacher = EMA of student (alpha=0.999, warm-up formula).
+# Student sees: kornia affine (±30° rot, 0.8-1.2 scale, ±0.1 trans) +
+#   kornia ColorJiggle (brightness±0.25, contrast±0.25).
+# Teacher sees: clean resize+normalize only.
+# L_pseudo = conf-weighted L1 (fixed denominator, out-of-frame masked).
+# L_mil retained: student confidence head needs positive signal.
+# L_absent retained: cross-task negative confidence via _step(unlabeled).
+# Ramp: epoch 0-1 pure supervised, epoch 2-7 linear ramp, epoch 7+ full.
+#
+# ── New supervised constraint ───────────────────────────────────────────────
+# A4C chamber angle sign: penalizes predicted angles that cross 90° relative
+# to GT. If GT is 85° (acute), prediction at 91° (obtuse) gets heavy penalty.
+#
+# ── What to watch ───────────────────────────────────────────────────────────
+#   semi/loss_pseudo        must decrease
+#   semi/teacher_conf_*     per task, should be stable or slowly increasing
+#   semi/n_valid_landmarks  stable, not collapsing to 0
+#   semi/ramp               sanity check
+#   val_mre_overall         compare to R45 at same epoch offset
+#   Decision point at epoch 15 (~4hr): if val_mre not improving, stop.
+
+d_model: 512
+
+backbone:
+  name: dinov2_vitb14
+  pretrained: true
+  input_size: 518
+  freeze_epochs: 0
+
+neck:
+  mode: c2f
+  layer_indices: [2, 5, 8, 11]
+  n_bottleneck: 2
+
+neck_dropout: 0.1
+
+decoder:
+  n_layers: 3
+  n_heads: 8
+  ffn_dim: 4096
+  dropout: 0.1
+
+head:
+  n_layers: 1
+  ffn_dim: 2048
+  n_inst: 1
+  dropout: 0.1
+  derive_bbox: true
+  use_affine: false
+  coord:
+    mode: geo_simcc
+    tau: 1.0
+    window_cells: 1.0
+    n_offset_bins: 32
+    coarse_sigma_cells: 1.0
+    shape_weight: 0.5
+    d_local: 64
+
+matcher:
+  cost_conf: 1.0
+  cost_box: 5.0
+  cost_ciou: 2.0
+  cost_land: 10.0
+
+optimizer:
+  lr_backbone: 1.0e-5
+  lr_neck: 1.0e-4
+  lr_decoder: 1.0e-4
+  lr_heads: 1.0e-3
+  weight_decay: 0.05
+  warmup_steps: 500
+  max_epochs: 30
+  eta_min_ratio: 0.05
+  layer_decay: 0.75
+
+semi:
+  enabled: true
+  batch_size: 16
+  lambda_mil: 0.05
+  lambda_eq: 0.0
+  lambda_pseudo: 1.0
+  alpha_ema: 0.999
+  ramp_start: 2
+  ramp_end: 7
+  photo_brightness: 0.25
+  photo_contrast: 0.25
+  eq_rotation_range: 30.0
+  eq_scale_range: [0.8, 1.2]
+  eq_translate_range: 0.1
+
+loss:
+  lambda_bbox: 1.0
+  lambda_conf: 1.0
+  lambda_conf_rank: 0.0
+  lambda_land: 5.0
+  lambda_param: 2.0
+  landmark_beta: 0.0
+  lambda_simcc: 0.0
+  lambda_heatmap: 1.0
+  neg_label_smooth: 0.0
+  lambda_shape_consistency: 0.01
+  lambda_ortho: 0.0
+  lambda_repulsion: 0.0
+  lambda_supportive: 0.0
+  lambda_evidence: 0.0
+  lambda_geo_consistency: 0.5
+  lambda_geo_constraint: 0.5
+  lambda_angle_sign: 0.1
+  shape_prior_path: data/shape_prior_v4.json
+
+miro:
+  lambda_miro: 0.0
+
+swad:
+  enabled: false
+
+data:
+  batch_size: 24
+  num_workers: 10
+  limit_train_batches: null
+  transform:
+    target_size: [518, 518]
+    rotation_range: 30.0
+    scale_range: [0.75, 1.25]
+    translate_range: 58.0
+    brightness_limit: 0.25
+    contrast_limit: 0.25
+    hflip_prob: 0.25
+    vflip_prob: 0.25
+  mosaic:
+    prob: 0.5
+    mode: distinct_task
+    close_epoch: 25
+  flip_close_epoch: 27
+
+logging:
+  project: fubio
+
+seed: 42
+precision: bf16-mixed
