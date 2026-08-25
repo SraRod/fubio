@@ -84,296 +84,173 @@ is available.
 
 ---
 
-The remainder of this document is the engineering reference for `src/fubio/` —
-module responsibilities, the per-task instance data flow, and the design
-decisions behind them.
+The remainder of this document is the engineering reference for `src/fubio/`:
+the layer structure, the data contract every stage of the pipeline honours, and
+the design decisions behind them.
 
-## `src/fubio/` Module Structure
+## Architecture
+
+Five layers. One model, nine tasks — the challenge rules forbid per-task
+networks, so task specificity is confined to layer 5.
+
+| Layer | Module | Role | Per-task? |
+|---|---|---|---|
+| 1 · Backbone | `models/backbone.py` | DINOv2 ViT-B/14 at 518×518 native → 37×37 patch tokens | shared |
+| 2 · Neck | `models/neck.py` | fuse backbone features into one spatial memory + sinusoidal 2D positional encoding | shared |
+| 3 · Decoder | `models/decoder.py` | cross-attention from queries into that memory | shared |
+| 4 · Refiner | `models/decoder.py` (`TaskRefinerLayer`) | self-attention among one task's queries | per-task |
+| 5 · TaskModule | `models/heads.py` + `models/coord_predictors.py` | owns the task's query embeddings, anchor positions and coordinate predictor | per-task |
+
+Adding a task means registering one `TaskDef`; the model then creates its
+`TaskModule` automatically. The shared decoder has no knowledge of tasks at all.
+
+Layer 5's coordinate predictor is swappable by config —
+`DirectPredictor`, `RefPointsPredictor`, `ShapePriorPredictor`,
+`HeatmapPredictor`, `SimCCPredictor`, `ShapeSimCCPredictor`,
+`GeoSimCCPredictor`. The submitted model uses **GeoSimCC**.
+
+### The canonical K=60 representation
+
+Nine tasks own between 2 and 22 landmarks each. Rather than carry ragged
+per-task arrays through the pipeline, every sample carries a **fixed `[60, 2]`
+canonical array**, with each task occupying its own contiguous slice
+(`data/task_registry.py`, `K = 60`). Three boolean masks disambiguate it:
+
+| Mask | Meaning |
+|---|---|
+| `landmark_valid_mask` | slots this task owns |
+| `landmark_supervised_mask` | owned **and** the CSV gives finite coordinates |
+| `landmark_visible_mask` | still inside the frame after augmentation |
+
+The cost is a padded tensor; the benefit is that collation is a plain stack,
+augmentation is shape-invariant, and a mosaic tile from A4C and one from IVC are
+the same shape and compose without special-casing. `local_to_canonical()` does
+the conversion at the manifest boundary, so nothing downstream handles per-task
+shapes.
+
+## Module map
 
 ```
 src/fubio/
-├── data/                               # Pure PyTorch, framework-independent
-│   │                                   # Lightning / serving 都 import 這裡，但這裡不 import 它們
-│   │                                   # Task owns its landmarks — 不存在 global K constant
-│   │
-│   ├── task_registry.py                # Task-centric schema — single source of truth
-│   │                                   #   TaskDef: task_id, task_int, domain, n_keypoints,
-│   │                                   #     landmark_names, flip_pairs, allow_hflip
-│   │                                   #   ParamDef: clinical parameters (formula + landmark indices)
-│   │                                   #   TASKS: dict[str, TaskDef] — 9 tasks 的完整定義
-│   │                                   #   擴增 task = 加一筆 TaskDef，不改任何既有定義
-│   │                                   #   per_task_flip_permutation(task_id) → int[K_task]
-│   │                                   #   [REMOVED] K=60, offset, local_to_canonical,
-│   │                                   #     landmark_valid_mask, global_flip_permutation
-│   │
-│   ├── config.py                       # DataConfig(BaseModel)
-│   │                                   #   image_size, augmentation toggles, loader params
-│   │
-│   ├── build_manifest.py               # 9 heterogeneous CSVs → unified parquet
-│   │                                   #   處理 GBK 編碼、HC path prefix、bracket coordinates
-│   │                                   #   輸出：data/manifest.parquet (198,557 records)
-│   │
-│   ├── manifest.py                     # ManifestDataset(Dataset) → SampleDict
-│   │                                   #   每筆 sample 輸出一個 image + list[InstanceDict]
-│   │                                   #   InstanceDict per instance:
-│   │                                   #     task_id:          int
-│   │                                   #     keypoints:        ndarray (K_task, 2) — per-task, 不 pad
-│   │                                   #     supervised_mask:  ndarray (K_task,) — has finite coords?
-│   │                                   #     visible_mask:     ndarray (K_task,) — init = supervised
-│   │                                   #     bbox:             ndarray (4,) — cx,cy,w,h from kp extremes
-│   │                                   #     transform_matrix: ndarray (3, 3) — identity
-│   │                                   #     original_hw:      ndarray (2,) — (H, W) of loaded image
-│   │                                   #     is_labeled:       bool
-│   │                                   #     image_path:       str
-│   │                                   #   不做 augmentation，不做 tensor 轉換
-│   │                                   #   [REMOVED] landmark_valid_mask — per-task 天然全 valid
-│   │
-│   ├── transforms.py                   # TransformPipeline — albumentations, dict in → dict out
-│   │                                   #   對 instances list 中每個 instance 的 (K_task, 2) 做變換
-│   │                                   #   code 已 shape-agnostic — 不依賴固定 K
-│   │                                   #   更新 transform_matrix, visible_mask, flip_applied
-│   │                                   #   kornia 不在這裡 — 只用於 train/views.py 的 EC loss
-│   │
-│   ├── spatial.py                      # Spatial transform utilities
-│   │                                   #   apply_spatial: shape-agnostic (K from runtime)
-│   │                                   #   apply_flip_permutation: per-task permutation
-│   │                                   #   map_to_original: dynamic K from input shape
-│   │                                   #   [REMOVED] global_flip_permutation, hardcoded 60
-│   │
-│   ├── mosaic.py                       # MosaicWrapper(Dataset) — same-task / cross-task mosaic
-│   │                                   #   各 tile 的 instances append 到 list — 不 stack、不 pad
-│   │                                   #   cross-task 自然支援：A4C (16,2) + IVC (2,2) 是獨立 items
-│   │                                   #   模擬 split-screen / PACS 截圖的臨床真實場景
-│   │
-│   ├── sampler.py                      # MixedTaskBatchSampler — batch-level task 分佈控制
-│   │                                   #   balanced / proportional 策略
-│   │                                   #   labeled / unlabeled 混合比例控制
-│   │
-│   ├── collate.py                      # collate_fn → batch dict
-│   │                                   #   image:   Tensor (B, 3, H, W) — stack, 唯一的 tensor 合併
-│   │                                   #   targets: list[list[InstanceDict]] — B images × instances
-│   │                                   #     不做 K padding，不做 instance padding
-│   │                                   #     每個 InstanceDict 保持 per-task shape (K_task, 2)
-│   │                                   #   model / training loop 負責 group-by-task
-│   │
-│   ├── split.py                        # K-fold stratified split, patient-level isolation
-│   │
-│   └── loaders.py                      # build_train_loader(), build_val_loader()
-│                                       #   組裝 Dataset + Sampler + collate → DataLoader
+├── data/            pure PyTorch, framework-independent — imports nothing from train/
+│   ├── task_registry.py       canonical K=60 landmark schema — single source of truth
+│   ├── ordering_schema.py     landmark ordering data models — pure schema, no registry dependency
+│   ├── landmark_ordering.py   bidirectional competition <-> canonical landmark conversion
+│   ├── types.py               shared type contracts for the pipeline
+│   ├── build_manifest.py      9 heterogeneous CSVs -> one manifest.parquet
+│   ├── build_cache.py         pre-decode and pre-resize every image into a numpy memmap
+│   ├── build_shape_prior.py   PCA shape prior from the labeled training landmarks
+│   ├── manifest.py            manifest -> decoded SampleDict (disk or memmap; ~80x apart)
+│   ├── transforms.py          spatial + photometric augmentation, images stay HWC
+│   ├── spatial.py             affine transforms — compose once, apply once
+│   ├── mosaic.py              configurable R×C grid composition on a shared canvas
+│   ├── sampler.py             balanced multi-task batch sampler for uneven task sizes
+│   ├── collate.py             SampleDicts -> tensor batches
+│   ├── split.py               train/val split builders
+│   ├── shape_prior.py         PCA shape prior for per-task landmark structure
+│   ├── supportive.py          supportive landmark computation and evidence detection
+│   ├── supportive_torch.py    the same, differentiable
+│   └── loaders.py             wires Dataset -> (Mosaic) -> Transform -> DataLoader
 │
-├── models/                             # Pure nn.Module — 不 import Lightning
-│   │                                   # Unified DETR decoder, ED-Pose pattern
-│   │                                   # 不依賴 FCOS / anchor / NMS — 全部 learned queries
-│   │
-│   ├── backbone.py                     # Backbone adapter → BackboneOutput (structured)
-│   │                                   #   BackboneOutput: spatial_tokens, spatial_shape,
-│   │                                   #     intermediate_features (for MIRO, None at inference)
-│   │                                   #   DINOv2Backbone: torch.hub 'dinov2_vitb14'
-│   │                                   #     input 518×518 (native, 37×37 = 1369 patches)
-│   │                                   #     → (B, 1369, 768) patch tokens
-│   │                                   #   [LATER] ConvNeXtV2Backbone
-│   │                                   #   freeze() / unfreeze() / param_groups()
-│   │
-│   ├── projection.py                   # Backbone → Decoder 的唯一 parametric bridge
-│   │                                   #   nn.Linear(C_backbone, D_model=256)
-│   │                                   #   + sinusoidal 2D positional encoding
-│   │                                   #   uses spatial_shape from BackboneOutput
-│   │                                   #   沒有 FPN，沒有 Neck — 跟 original DETR 一樣
-│   │
-│   ├── decoder.py                      # Shared DETR TransformerDecoder
-│   │                                   #   L=6, D=256, H=8, d_head=32, FFN=1024
-│   │                                   #   forward(memory, queries) → (B, N_q, 256)
-│   │                                   #   return_intermediate=True → (L, B, N_q, 256) for aux loss
-│   │                                   #   同一份 weights — query 決定 output 語意
-│   │                                   #   Layer: Self-Attn → Cross-Attn → FFN (DETR order)
-│   │                                   #   per-layer positional injection (not just input)
-│   │
-│   ├── queries.py                      # Query embeddings + composition
-│   │                                   #   DetectionQueries: nn.Embedding(N_det=20, 256)
-│   │                                   #   LandmarkQueries: nn.ModuleDict — per-task
-│   │                                   #     "A4C": Embedding(16, 256)
-│   │                                   #     "PLAX": Embedding(22, 256) ... ×9 tasks
-│   │                                   #     task owns its landmarks — 擴增 task 只需加 entry
-│   │                                   #   build_landmark_queries(det_feat, task_id):
-│   │                                   #     Q = point_emb[task_id] + det_feat
-│   │                                   #     point_emb = "哪個 landmark" (what)
-│   │                                   #     det_feat  = "task 在哪" (where, from Pass 1)
-│   │
-│   ├── heads.py                        # Output heads — small MLPs
-│   │                                   #   DetectionHead: (N_det, 256) → bbox(4), task(9), conf(1)
-│   │                                   #   LandmarkHead:  (K_task, 256) → (x, y) normalized [0,1]
-│   │                                   #   UncertaintyHead: (K_task, 256) → σ > 0
-│   │                                   #     config toggle, default OFF
-│   │
-│   └── model.py                        # FUBioModel → ModelOutput (structured)
-│                                       #   forward(images, targets=None):
-│                                       #     backbone → projection + pos_enc → memory
-│                                       #     decoder(memory, Q_det)     → Pass 1: detection
-│                                       #     group_by_task(targets)     → per-task batched
-│                                       #     for each task:
-│                                       #       idx = instances' image indices
-│                                       #       decoder(memory[idx], Q_lm) → Pass 2
-│                                       #   Per-task batched: 同 task 的 instances 合併成
-│                                       #   一次 decoder call（≤9 calls），不是 per-instance
+├── models/          pure nn.Module — imports nothing from Lightning
+│   ├── backbone.py            backbone wrappers producing structured multi-level features
+│   ├── neck.py                Layer 2 — backbone features -> spatial memory (+ 2D pos enc)
+│   ├── decoder.py             Layers 3 and 4 — cross-attention decoder, per-task refiner
+│   ├── queries.py             query position encoding utilities
+│   ├── heads.py               TaskModule — query ownership, refinement, prediction
+│   ├── coord_predictors.py    the seven interchangeable coordinate predictors
+│   └── model.py               FUBioModel — assembles the layers into per-task TaskOutputs
 │
-├── train/                              # Lightning layer — inference / serving 不 import 這裡
-│   │
-│   ├── config.py                       # ExperimentConfig (pydantic-settings)
-│   │                                   #   BackboneConfig: name, pretrained, freeze_epochs
-│   │                                   #   DecoderConfig: n_layers, d_model, n_heads, ffn_dim
-│   │                                   #   LossConfig: λ_det, λ_land, λ_param, use_uncertainty
-│   │                                   #   OptimizerConfig: lr_backbone, lr_decoder, warmup
-│   │                                   #   MIROConfig: enabled, lambda, layers
-│   │                                   #   從 YAML + env override 載入
-│   │
-│   ├── datamodule.py                   # FUBioDataModule(LightningDataModule)
-│   │                                   #   thin adapter: 組裝 data/ 的 Dataset + Loader
-│   │                                   #   fold setup, reproducible state
-│   │
-│   ├── module.py                       # FUBioModule(LightningModule)
-│   │                                   #   training_step:
-│   │                                   #     → _detection_loss (Hungarian → L1 + CIoU + CE)
-│   │                                   #     → per-task _landmark_loss (Huber or GaussianNLL)
-│   │                                   #     → per-task _param_loss (Huber on geometry)
-│   │                                   #     → _miro_loss (when enabled)
-│   │                                   #     → _aux_loss (intermediate decoder layers)
-│   │                                   #   group_instances_by_task(targets) for per-task routing
-│   │                                   #   configure_optimizers:
-│   │                                   #     differential LR — backbone 1e-5, decoder/heads 1e-3
-│   │                                   #   Phase control: freeze/unfreeze backbone
-│   │                                   #   precision="bf16-mixed"
-│   │
-│   ├── losses.py                       # Loss functions
-│   │                                   #   detection_loss: L1 + CIoU (bbox) + CE (task cls, 9-way)
-│   │                                   #   landmark_loss: Huber (SmoothL1, β configurable)
-│   │                                   #     or GaussianNLL when σ enabled
-│   │                                   #   param_loss: Huber on differentiable geometry output
-│   │
-│   ├── matcher.py                      # Hungarian matching for detection queries
-│   │                                   #   cost = λ_cls·CE + λ_box·(L1 + CIoU)
-│   │                                   #   scipy.optimize.linear_sum_assignment
-│   │                                   #   Ref: DETR (Carion et al., ECCV 2020)
-│   │
-│   ├── regularizer.py                  # MIRO regularizer
-│   │                                   #   MeanEncoder, VarianceEncoder, MIROEncoders
-│   │                                   #   build_miro_encoders(backbone, input_shape)
-│   │                                   #   consumes BackboneOutput.intermediate_features
-│   │                                   #   config-driven toggle — 不啟用時零成本
-│   │
-│   ├── callbacks.py                    # Lightning callbacks
-│   │                                   #   CSVCallback: per-epoch val CSV ↔ checkpoint naming
-│   │                                   #   SWADCallback: dense weight averaging + dead valley
-│   │                                   #   CustomAveragedModel: step-tracked averaging
-│   │
-│   ├── schedule.py                     # LR scheduling
-│   │                                   #   Linear warmup + cosine decay
-│   │                                   #   Phase-aware freeze/unfreeze control
-│   │
-│   └── train.py                        # CLI entry point (typer)
-│                                       #   load config → model → callbacks → Trainer.fit()
-│                                       #   WandB logger, ModelCheckpoint
+├── train/           Lightning layer — serving/ never imports this
+│   ├── config.py              ExperimentConfig hierarchy (pydantic-settings, YAML + env)
+│   ├── datamodule.py          real-data LightningDataModule over the data/ pipeline
+│   ├── mock_datamodule.py     synthetic generator for end-to-end pipeline tests
+│   ├── module.py              FUBioModule — single-pass multi-task training step
+│   ├── losses.py              landmark / detection / parameter / consistency losses
+│   ├── matcher.py             per-task Hungarian matching, instance queries <-> GT
+│   ├── views.py               differentiable geometric views for semi-supervised consistency
+│   ├── regularizer.py         MIRO — mutual information regularization with oracle
+│   ├── schedule.py            phase-aware warmup + cosine, with backbone freeze
+│   ├── callbacks.py           CSV logging and SWAD weight averaging
+│   ├── viz_callback.py        validation prediction grids
+│   └── train.py               CLI entry point
 │
-├── evaluation/                         # Training + inference 共用
-│   │
-│   ├── parameters.py                   # Clinical parameter geometry (differentiable, pixel space)
-│   │                                   #   distance: ||p_i − p_j||          (25 params)
-│   │                                   #   ellipse_c: Ramanujan             (HC, FA)
-│   │                                   #   angle: arccos(dot/norms)         (AOP)
-│   │                                   #   compute_params(landmarks, task_id) → dict
-│   │                                   #   gradient flows through — used by L_param
-│   │
-│   ├── metrics.py                      # MRE (per-task + overall)
-│   │                                   # Parameter MAE (per-param)
-│   │                                   # Per-task + per-domain aggregation
-│   │
-│   └── postprocessing.py              # Prediction → submission format
-│                                       #   coord inversion via transform_matrix
-│                                       #   pixel clipping, JSON serialization
-│                                       #   per-task landmark reordering
+├── evaluation/      shared by training and inference
+│   ├── geometry.py            differentiable clinical parameter geometry, 0 learnable params
+│   ├── metrics.py             MRE, parameter MAE, bbox precision
+│   └── postprocessing.py      model output -> original pixel coordinates -> submission JSON
 │
-└── serving/                            # [LATER] Docker inference — 零 Lightning 依賴
-    └── predict.py                      # checkpoint → model.eval() → forward()
-                                        #   transform_matrix 反算 organizer pixel space
-                                        #   輸出 JSON: landmarks (pixel coords)
+├── serving/         inference — no Lightning dependency on the graded path
+│   ├── predict.py             checkpoint + images -> submission JSON
+│   ├── validate.py            submission integrity checks — every failure is loud
+│   └── viewer_export.py       all-instance viewer cache from a trained checkpoint
+│
+└── viz/
+    └── overlay.py             shared plotly overlay drawing for landmark geometry
 ```
 
-## Data Flow — Per-Task Instance Design
+## Data flow
 
 ```
-CSV (per-task local coords, e.g. A4C: 16 points)
+9 per-task CSVs (task-local landmark order)
   │
-  ▼ build_manifest.py
-manifest.parquet (198,557 records)
+  ▼ data/build_manifest.py        GBK encoding, HC path prefixes, bracketed coordinates
+manifest.parquet
   │
-  ▼ ManifestDataset.__getitem__()
-SampleDict:
-  image:     ndarray (H, W, 3) uint8
-  instances: [InstanceDict]              # list, length 1 for single-image
+  ▼ data/manifest.py              local_to_canonical() happens here, and only here
+SampleDict
+  image             [H, W, 3] uint8, BGR->RGB
+  keypoints         [1, 60, 2] float32, NaN for slots this task does not own
+  transform_matrix  [1, 3, 3] identity
+  landmark_{valid,supervised,visible}_mask, task_ids, is_labeled, original_hws
   │
-  ▼ MosaicWrapper (optional)
-SampleDict:
-  image:     ndarray (H, W, 3)           # composited
-  instances: [InstanceDict, ...]         # 1-4 instances, may be different tasks
-  │                                      # A4C: (16, 2), IVC: (2, 2) — 不 pad, 不 stack
+  ▼ data/mosaic.py (optional)     tiles may come from different tasks — same shape, so they just stack
+SampleDict with I instances on one canvas
   │
-  ▼ TransformPipeline
-SampleDict:                              # same structure, augmented values
-  image:     ndarray (tgt_H, tgt_W, 3) float32, normalized
-  instances: [InstanceDict, ...]         # keypoints transformed, masks updated
+  ▼ data/transforms.py            albumentations; updates transform_matrix and visible_mask
+SampleDict, augmented
   │
-  ▼ collate_fubio()
-batch dict:
-  image:   Tensor (B, 3, H, W)          # stack — 唯一做 tensor 合併的
-  targets: list[list[InstanceDict]]      # B × instances — 不 pad K, 不 pad I
+  ▼ data/collate.py
+batch
+  image      [B, 3, H, W]
+  keypoints  [B, I_max, 60, 2] float32, NaN -> 0.0 (masks carry the truth)
 ```
 
-InstanceDict (per instance, per-task shape):
+`transform_matrix` accumulates every spatial operation, so
+`evaluation/postprocessing.py` can invert the whole chain in one step and emit
+coordinates in the organizers' original pixel space. Predictions are submitted
+as **pixel coordinates only** — the organizers hold the pixel spacing and
+convert to millimetres server-side, which is why the clinical parameter layer is
+trained in pixel space and is scale-invariant.
 
-| Key | Shape | Note |
-|---|---|---|
-| `task_id` | `int` | 0-8, from TaskDef.task_int |
-| `keypoints` | `(K_task, 2)` | A4C=16, IVC=2, per-task |
-| `supervised_mask` | `(K_task,)` | has finite GT coords? |
-| `visible_mask` | `(K_task,)` | in bounds after aug? |
-| `bbox` | `(4,)` | cx, cy, w, h from kp extremes |
-| `transform_matrix` | `(3, 3)` | accumulated affine |
-| `original_hw` | `(2,)` | source image (H, W) |
-| `is_labeled` | `bool` | unlabeled → keypoints = NaN |
-| `image_path` | `str` | relative path |
-| `flip_applied` | `bool` | hflip state |
-
-## Top-level Directories
+## Repository layout
 
 ```
-src/fubio/       # the engine — data / models / train / evaluation / serving / viz
-configs/         # 實驗 config YAML（pydantic-settings 載入）— 本 repo 只收提交模型的血緣鏈
-docker/          # 提交用的推論容器，與評分時完全相同
-scripts/         # make_submission.py / validate_checkpoint.py
-tests/           # pytest + hypothesis（等變性 property tests）
-data/            # ~18G 影像資料 — organizer 發布，CC BY-NC，不隨本 repo 散布
+src/fubio/    the engine
+configs/      training configs (pydantic-settings). Only the submitted model's lineage is here
+docker/       the inference container, identical to the one that was graded
+scripts/      make_submission.py, validate_checkpoint.py
+tests/        pytest + hypothesis (equivariance property tests)
+data/         ~18 GB of images — organizer-distributed under CC BY-NC, not redistributed here
 ```
 
-原始開發環境另有 `notebooks/`（marimo 探索）、`viewer/`（streamlit 檢視器）與
-organizer baseline code；這些不屬於方法本身，未納入公開釋出。
+The development environment also holds `notebooks/` (marimo exploration), a
+streamlit instance viewer, and the organizers' baseline code. None of that is
+part of the method, so none of it is released.
 
-## Key Design Decisions
+## Key design decisions
 
 | Decision | Choice | Why |
 |---|---|---|
-| Data representation | Per-task InstanceDict, no global K | Task owns landmarks。list-of-dicts 不需要 pad K。擴增 task = 加 TaskDef |
-| Architecture | Unified DETR decoder (ED-Pose pattern) | 一個 decoder 兩種 query — detection + landmark。消除 FCOS/anchor/NMS。Ref: Yang et al. ICLR 2023 |
-| Backbone bridge | Linear projection only (no FPN/Neck) | 跟 original DETR 一樣。DINOv2 self-attention 已有全局 context |
-| Landmark queries | Per-task nn.ModuleDict | Task 獨立 embedding，擴增 = 加 entry |
-| Det→Lm conditioning | Q_lm = point_emb + det_feat | det_feat 攜帶 task identity + spatial position |
-| Backbone | DINOv2-B/14 first, 518×518 native | 37×37 patches, 142M SSL。ConvNeXt V2-B 之後加 |
-| Training framework | Lightning Trainer + LightningModule | SWAD / CSV-logging callbacks port cleanly onto Lightning |
-| MIRO | Config toggle, off by default | 保護 pretrained features；Round 2 A/B vs LP-FT vs diff-LR |
-| Augmentation | albumentations (data pipeline) | KeypointParams edge-case 成熟；kornia 僅用於 EC loss (Round 3) |
-| Precision | bf16-mixed | A100 同 throughput，不需 loss scaling |
-| Clinical params | pixel space, differentiable | organizer server-side px→mm；gradient flows for L_param |
-| Config | pydantic-settings (YAML + env) | 禁 dataclass；取代 OmegaConf |
-| Landmark loss | Huber / GaussianNLL | β configurable；σ 啟用時切 GaussianNLL |
-| Detection loss | L1 + CIoU + CE + Hungarian | CE for 9-way mutually exclusive tasks (not BCE) |
-| Collate | Stack images only, targets as list | 不 pad K、不 pad I — model 負責 group-by-task |
-| Per-task batching | group_by_task → batched decoder call per task | ≤9 calls not N_instances — 同 task instances 合併 |
-| Uncertainty | UncertaintyHead toggleable, default OFF | Conformal calibration 可開發但初始關閉 |
+| Landmark representation | Canonical `[60, 2]` + three masks | Uniform shape makes collation a stack and lets mosaic tiles from different tasks compose without special-casing. Padding is the price |
+| Task extension | Register one `TaskDef` | The model auto-creates the `TaskModule`. No existing definition is touched |
+| Architecture | Shared decoder + per-task TaskModule | The rules require one unified model. Task specificity is confined to layer 5, where it is cheapest |
+| Backbone | DINOv2 ViT-B/14, 518×518 native | 37×37 patches at native resolution; self-supervised features transfer to ultrasound better than the ConvNeXt V2 line we also tried |
+| Coordinate head | GeoSimCC (of seven interchangeable predictors) | Config-swappable, so head choice is an experiment rather than a rewrite |
+| Clinical parameters | Differentiable, in pixel space | The organizers convert to millimetres server-side; gradients flow into the landmark layer |
+| Detection matching | Per-task Hungarian | Instance queries are matched within a task, never across |
+| Augmentation | albumentations in the data pipeline | Mature keypoint edge-case handling. kornia is reserved for the differentiable on-GPU path in `train/views.py` |
+| Flip | Disabled for symmetric two-point tasks | hflip/vflip swaps endpoints whose ground-truth order is otherwise stable, injecting label noise |
+| Precision | bf16-mixed | Same throughput on A100 without loss scaling |
+| Config | pydantic-settings, YAML + env | Validated at load; no dataclasses anywhere in the codebase |
+| Dataframes | polars | Strict schemas catch dirty CSV values at the manifest boundary rather than at training time |
