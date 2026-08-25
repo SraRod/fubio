@@ -66,6 +66,7 @@ def make_sample(
         "landmark_valid_mask": valid[np.newaxis],
         "landmark_supervised_mask": supervised[np.newaxis],
         "landmark_visible_mask": supervised.copy()[np.newaxis],
+        "landmark_evidence_mask": np.zeros_like(supervised)[np.newaxis],
         "task_ids": np.array([task.task_int], dtype=np.int64),
         "is_labeled": np.array([labeled], dtype=bool),
         "image_paths": [f"fake/{task_id}/test.png"],

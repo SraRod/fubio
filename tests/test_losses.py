@@ -112,7 +112,7 @@ class TestLandmarkLoss:
         gt = torch.rand(N, K, 2)
         mask = torch.ones(N, K, dtype=torch.bool)
 
-        loss = landmark_loss(gt.clone(), gt, mask, k_task=K)
+        loss = landmark_loss(gt.clone(), gt, mask)
         assert loss.item() == pytest.approx(0.0, abs=1e-6)
 
     def test_known_offset(self) -> None:
@@ -122,7 +122,7 @@ class TestLandmarkLoss:
         pred = torch.tensor([[[0.5, 0.6]]])
         mask = torch.ones(N, K, dtype=torch.bool)
 
-        loss = landmark_loss(pred, gt, mask, k_task=K, beta=1.0)
+        loss = landmark_loss(pred, gt, mask, beta=1.0)
         expected = 0.5 * (0.1**2) / 1.0 / 2
         assert loss.item() == pytest.approx(expected, abs=1e-5)
 
@@ -139,19 +139,26 @@ class TestLandmarkLoss:
         pred_close[0, 0] = gt[0, 0]
         pred_close[1, 2] = gt[1, 2]
 
-        loss = landmark_loss(pred_close, gt, mask, k_task=K)
+        loss = landmark_loss(pred_close, gt, mask)
         assert loss.item() == pytest.approx(0.0, abs=1e-5)
 
-    def test_k_task_normalization(self) -> None:
-        """Larger K_task produces smaller per-landmark contribution."""
+    def test_normalization_ignores_unmasked_slots(self) -> None:
+        """Loss depends only on masked elements, not on the tensor's K."""
         N = 2
-        gt = torch.rand(N, 1, 2)
-        pred = gt + 0.1
-        mask = torch.ones(N, 1, dtype=torch.bool)
+        gt_small = torch.rand(N, 1, 2)
+        pred_small = gt_small + 0.1
+        mask_small = torch.ones(N, 1, dtype=torch.bool)
 
-        loss_small_k = landmark_loss(pred, gt, mask, k_task=2)
-        loss_large_k = landmark_loss(pred, gt, mask, k_task=22)
-        assert loss_large_k.item() < loss_small_k.item()
+        # Same supervised landmark, padded out to K=22 with masked-off slots.
+        gt_large = torch.rand(N, 22, 2)
+        gt_large[:, 0] = gt_small[:, 0]
+        pred_large = gt_large + 0.1
+        mask_large = torch.zeros(N, 22, dtype=torch.bool)
+        mask_large[:, 0] = True
+
+        loss_small = landmark_loss(pred_small, gt_small, mask_small)
+        loss_large = landmark_loss(pred_large, gt_large, mask_large)
+        assert loss_large.item() == pytest.approx(loss_small.item(), abs=1e-6)
 
     def test_with_uncertainty(self) -> None:
         """sigma provided -> GaussianNLL path produces finite loss."""
@@ -161,9 +168,9 @@ class TestLandmarkLoss:
         mask = torch.ones(N, K, dtype=torch.bool)
         sigma = torch.ones(N, K, 2) * 0.01
 
-        loss = landmark_loss(pred, gt, mask, k_task=K, sigma=sigma)
+        loss = landmark_loss(pred, gt, mask, sigma=sigma)
         assert torch.isfinite(loss)
-        loss_no_sigma = landmark_loss(pred, gt, mask, k_task=K)
+        loss_no_sigma = landmark_loss(pred, gt, mask)
         assert loss.item() != pytest.approx(loss_no_sigma.item())
 
     def test_no_valid_landmarks(self) -> None:
@@ -173,7 +180,7 @@ class TestLandmarkLoss:
         pred = gt + 1.0
         mask = torch.zeros(N, K, dtype=torch.bool)
 
-        loss = landmark_loss(pred, gt, mask, k_task=K)
+        loss = landmark_loss(pred, gt, mask)
         assert loss.item() == 0.0
 
 

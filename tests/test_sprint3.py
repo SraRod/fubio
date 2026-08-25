@@ -83,6 +83,11 @@ def _make_stub_module(config: ExperimentConfig | None = None) -> FUBioModule:
 
     model = FUBioModel.__new__(FUBioModel)
     nn.Module.__init__(model)
+    # __init__ is bypassed above, so plain attributes it would set must be
+    # mirrored by hand. _geo=False selects the non-GeoSimCC path, which needs
+    # neither loc_k_proj nor the fine-detail stem. Keep in sync with
+    # FUBioModel.__init__ when it gains a new non-Module attribute.
+    model._geo = False
     model.n_inst = n_inst
 
     model.backbone = _StubBackbone()
@@ -205,28 +210,28 @@ class TestLandmarkLoss:
         pred = torch.tensor([[[0.5, 0.5], [0.6, 0.6]]])
         gt = pred.clone()
         mask = torch.ones(1, 2, dtype=torch.bool)
-        loss = landmark_loss(pred, gt, mask, k_task=2)
+        loss = landmark_loss(pred, gt, mask)
         assert loss.item() < 1e-5
 
     def test_positive_error(self) -> None:
         pred = torch.tensor([[[0.5, 0.5]]])
         gt = torch.tensor([[[0.8, 0.8]]])
         mask = torch.ones(1, 1, dtype=torch.bool)
-        loss = landmark_loss(pred, gt, mask, k_task=1)
+        loss = landmark_loss(pred, gt, mask)
         assert loss.item() > 0
 
     def test_mask_excludes(self) -> None:
         pred = torch.tensor([[[0.5, 0.5], [99.0, 99.0]]])
         gt = torch.tensor([[[0.5, 0.5], [0.0, 0.0]]])
         mask = torch.tensor([[True, False]])
-        loss = landmark_loss(pred, gt, mask, k_task=2)
+        loss = landmark_loss(pred, gt, mask)
         assert loss.item() < 1e-5
 
     def test_empty_mask(self) -> None:
         pred = torch.randn(1, 4, 2)
         gt = torch.randn(1, 4, 2)
         mask = torch.zeros(1, 4, dtype=torch.bool)
-        loss = landmark_loss(pred, gt, mask, k_task=4)
+        loss = landmark_loss(pred, gt, mask)
         assert loss.item() == 0.0
 
 
@@ -270,6 +275,11 @@ class TestModelArchitecture:
         """End-to-end forward pass with stub backbone."""
         model = FUBioModel.__new__(FUBioModel)
         nn.Module.__init__(model)
+        # __init__ is bypassed above, so plain attributes it would set must be
+        # mirrored by hand. _geo=False selects the non-GeoSimCC path, which needs
+        # neither loc_k_proj nor the fine-detail stem. Keep in sync with
+        # FUBioModel.__init__ when it gains a new non-Module attribute.
+        model._geo = False
         model.n_inst = 2
         model.backbone = _StubBackbone()
         model.neck = LinearNeck(C_BACKBONE, D)

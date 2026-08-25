@@ -100,7 +100,10 @@ class TestTaskModuleQueries:
         tm = TaskModule(n_keypoints=K, d_model=D, n_inst=n_inst)
         q, qp = tm.get_queries(batch_size=B)
         assert q.shape == (B, n_inst * (1 + K), D)
-        assert qp is None  # no anchors without use_anchors
+        # Without anchors the positional term is zeros, not None — callers add it
+        # unconditionally and zeros are the no-op under addition.
+        assert qp.shape == q.shape
+        assert torch.equal(qp, torch.zeros_like(qp))
 
     def test_n_queries(self) -> None:
         n_inst = 2
@@ -242,6 +245,11 @@ def _make_model() -> nn.Module:
 
     model = FUBioModel.__new__(FUBioModel)
     nn.Module.__init__(model)
+    # __init__ is bypassed above, so plain attributes it would set must be
+    # mirrored by hand. _geo=False selects the non-GeoSimCC path, which needs
+    # neither loc_k_proj nor the fine-detail stem. Keep in sync with
+    # FUBioModel.__init__ when it gains a new non-Module attribute.
+    model._geo = False
     n_inst = 2
     model.n_inst = n_inst
     model.backbone = _StubBackbone()
