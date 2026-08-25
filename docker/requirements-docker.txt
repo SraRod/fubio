@@ -1,0 +1,24 @@
+# Inference-only deps for Docker submission.
+# torch 2.3.1, torchvision 0.18.1, numpy 1.26.4 already in base image.
+# Pin numpy<2 to prevent upgrades that break torch 2.3.1.
+numpy<2
+
+# Config
+pydantic>=2.0,<3
+pydantic-settings>=2.0,<3
+python-dotenv
+
+# Image I/O
+opencv-python-headless
+Pillow
+
+# TTA warp
+kornia
+
+# Shape prior loading
+polars
+
+# Misc
+tqdm
+pyyaml
+packaging
