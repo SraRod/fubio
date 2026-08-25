@@ -7,3 +7,10 @@ __pycache__/
 .venv/
 .pytest_cache/
 .ruff_cache/
+
+# Local convenience symlinks into the engine repo's dataset, so the tests here
+# can reach data the public repo must never carry. Committing them would publish
+# a broken absolute path into someone's home directory.
+data/cache
+data/images
+data/manifest.parquet
