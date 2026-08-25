@@ -1,0 +1,9 @@
+# Model checkpoint — 556 MB, distributed as a GitHub Release asset.
+*.pth
+*.ckpt
+
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
