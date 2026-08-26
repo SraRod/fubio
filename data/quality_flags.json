@@ -1,0 +1,50 @@
+{
+  "images/A4C/PNG_IM_0331-001.png": {
+    "type": "bad_label",
+    "note": ""
+  },
+  "images/A4C/PNG_IM_0713-003.png": {
+    "type": "bad_label",
+    "note": ""
+  },
+  "images/A4C/PNG_IM_0329-002.png": {
+    "type": "bad_label",
+    "note": ""
+  },
+  "images/A4C/PNG_IM_0330-007.png": {
+    "type": "bad_label",
+    "note": ""
+  },
+  "images/A4C/PNG_IM_0345-000.png": {
+    "type": "bad_label",
+    "note": ""
+  },
+  "images/A4C/PNG_IM_0346-016.png": {
+    "type": "bad_label",
+    "note": ""
+  },
+  "images/A4C/PNG_IM_0712-015.png": {
+    "type": "bad_label",
+    "note": ""
+  },
+  "images/A4C/PNG_IM_0716-012.png": {
+    "type": "bad_label",
+    "note": ""
+  },
+  "images/A4C/PNG_IM_0766.png": {
+    "type": "bad_label",
+    "note": "RA cross-angle 31.6° (should be ~90°)"
+  },
+  "images/A4C/PNG_IM_0800-006.png": {
+    "type": "swapped_points",
+    "note": ""
+  },
+  "images/PLAX/PNG_IM_0866-004_s02.png": {
+    "type": "bad_label",
+    "note": ""
+  },
+  "images/PLAX/PNG_IM_0866-006.png": {
+    "type": "bad_label",
+    "note": ""
+  }
+}
