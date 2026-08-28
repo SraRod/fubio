@@ -27,7 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -1240,7 +1240,7 @@ def main() -> None:
         "input_size": input_size,
         "mode": args.mode,
         "data_root": str(data_root),
-        "timestamp": datetime.now(tz=UTC).isoformat(),
+        "timestamp": datetime.now(tz=timezone.utc).isoformat(),
         "n_predictions": len(results),
     }
     save_outputs(

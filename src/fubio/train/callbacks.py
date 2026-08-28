@@ -216,13 +216,21 @@ class CSVCallback(L.Callback):
         row = {"epoch": trainer.current_epoch, **metrics}
 
         # Metric keys can appear mid-run (a loss term switching on), so widen the
-        # header rather than silently dropping columns or misaligning rows.
+        # header rather than silently dropping columns or misaligning rows. The
+        # accumulated rows are rewritten under the widened header, not discarded.
         if self._fieldnames is None:
             self._fieldnames = list(row)
         elif not set(row) <= set(self._fieldnames):
             self._fieldnames = self._fieldnames + [k for k in row if k not in self._fieldnames]
-            self._header_written = False
-            self._csv_path.unlink(missing_ok=True)
+            previous_rows: list[dict] = []
+            if self._csv_path.exists():
+                with self._csv_path.open(newline="") as fh:
+                    previous_rows = list(csv.DictReader(fh))
+            with self._csv_path.open("w", newline="") as fh:
+                writer = csv.DictWriter(fh, fieldnames=self._fieldnames, restval="")
+                writer.writeheader()
+                writer.writerows(previous_rows)
+            self._header_written = True
 
         write_header = not self._header_written and not self._csv_path.exists()
 
