@@ -28,10 +28,10 @@ from fubio.train.config import ExperimentConfig
 from fubio.train.losses import mil_loss
 from fubio.train.module import FUBioModule
 
-# r22-semi-mil.yaml was deleted; r48-semi.yaml is the config behind the submitted
-# model, so the routing paths under test are the ones that actually shipped.
+# stage3.yaml (lineage run R48-semi) is the config behind the submitted model,
+# so the routing paths under test are the ones that actually shipped.
 # Resolved from __file__ rather than the CWD — pytest may be invoked from anywhere.
-CONFIG_PATH = Path(__file__).resolve().parents[1] / "configs" / "r48-semi.yaml"
+CONFIG_PATH = Path(__file__).resolve().parents[1] / "configs" / "stage3.yaml"
 
 
 def _instance(task_str: str, *, labeled: bool) -> dict:

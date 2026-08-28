@@ -304,7 +304,8 @@ class LossConfig(BaseModel, frozen=True):
     lambda_conf_rank: float = 0.0
     lambda_land: float = 5.0
     lambda_param: float = 2.0
-    landmark_beta: float = 1.0
+    # 0.0 = pure L1, the submitted setting (paper Eq. 1); stage configs omit it.
+    landmark_beta: float = 0.0
     # Rejected until a variance head is implemented — accepting it silently
     # runs SmoothL1 while the config claims GaussianNLL.
     use_uncertainty: bool = False
