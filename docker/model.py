@@ -139,13 +139,7 @@ class Model:
         loss["shape_prior_path"] = str(SHAPE_PRIOR_PATH)
         hp["loss"] = loss
 
-        head = hp.get("head", {})
-        coord_mode = head.get("coord", {}).get("mode", "")
-        if head.get("use_affine") and coord_mode in ("simcc", "shape_simcc"):
-            hp["head"] = {**head, "use_affine": False}
-            if hp.get("loss", {}).get("lambda_ortho", 0) > 0:
-                hp["loss"] = {**hp["loss"], "lambda_ortho": 0.0}
-            logger.info("Patched use_affine=True→False for %s", coord_mode)
+        coord_mode = hp.get("head", {}).get("coord", {}).get("mode", "")
 
         # --- Config ---
         from fubio.train.config import ExperimentConfig
@@ -166,10 +160,6 @@ class Model:
         # --- Build FUBioModel directly (no LightningModule overhead) ---
         from fubio.models.model import FUBioModel
 
-        _use_sup = (
-            self._config.loss.lambda_supportive > 0
-            or self._config.loss.lambda_evidence > 0
-        )
         model = FUBioModel(
             backbone_name=self._config.backbone.name,
             d_model=self._config.d_model,
@@ -179,18 +169,12 @@ class Model:
             n_decoder_layers=self._config.decoder.n_layers,
             n_head_layers=self._config.head.n_layers,
             n_inst=self._config.head.n_inst,
-            use_uncertainty=self._config.loss.use_uncertainty,
             derive_bbox=self._config.head.derive_bbox,
-            use_affine=self._config.head.use_affine,
-            return_intermediate=False,
             coord_config=self._config.head.coord,
             shape_prior=shape_prior,
             neck_config=self._config.neck,
             neck_dropout=self._config.neck_dropout,
             dropout=self._config.decoder.dropout,
-            conf_mlp_layers=self._config.head.conf_mlp_layers,
-            input_size=max(self._config.backbone.input_size),
-            use_supportive=_use_sup,
         )
 
         # --- Load teacher weights (strict) ---

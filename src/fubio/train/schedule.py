@@ -18,7 +18,7 @@ class PhaseScheduler(torch.optim.lr_scheduler.LambdaLR):
     """Per-group LR multiplier with backbone freeze awareness.
 
     The optimizer must have at least three parameter groups in order:
-    [backbone, neck, heads, ...extra]. Extra groups (e.g. MIRO encoders)
+    [backbone, neck, heads, ...extra]. Extra groups
     follow the same schedule as neck/heads.
 
     - **Backbone** (group 0): multiplier = 0 during Phase 0 (``step < freeze_steps``).

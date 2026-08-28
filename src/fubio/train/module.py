@@ -61,30 +61,20 @@ from fubio.models.heads import derive_bbox_masked
 from fubio.models.model import FUBioModel, ModelOutput
 from fubio.train.config import (
     ExperimentConfig,
-    GeoSimCCCoordConfig,
     HeadTuneConfig,
-    HeatmapCoordConfig,
     OptimizerConfig,
-    ShapePriorCoordConfig,
-    ShapeSimCCCoordConfig,
-    SimCCCoordConfig,
 )
 from fubio.train.losses import (
     bbox_loss,
     conf_focal_loss,
-    conf_ranking_loss,
     equivariance_loss,
     geometric_constraint_loss,
     heatmap_loss,
-    instance_repulsion_loss,
     landmark_loss,
     mil_loss,
-    ortho_regularization,
     param_loss,
     pseudo_label_loss,
     shape_consistency_loss,
-    shape_residual_loss,
-    simcc_loss,
 )
 from fubio.train.matcher import PerTaskMatcher
 from fubio.train.schedule import PhaseScheduler
@@ -117,55 +107,23 @@ class FUBioModule(L.LightningModule):
             "_img_std",
             torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1),
         )
-        self._miro_enabled = config.miro.lambda_miro > 0
-
-        # Load shape prior when any component needs it:
-        # - ShapePriorPredictor: mean/basis for PCA decomposition
-        # - HeatmapPredictor with data_prior: mean_xy/std_xy for spatial prior
-        # - [P1: Anchor query position] TaskModule: mean_xy for anchor init
-        # - [P2: SimCC readout] SimCCPredictor doesn't need it, but anchors do
+        # Load the shape prior: GeoSimCC's SHAPE stage needs the PCA mean/basis,
+        # and TaskModule initializes its query anchors from the prior means.
         #
         # Staleness is NOT checked here on purpose. load_from_checkpoint re-runs this
         # __init__ during serving, where no manifest exists (Docker) and where the
         # checkpoint's own buffers override whatever this reads anyway. The manifest
         # comparison lives in train.py (verify_shape_prior_provenance).
-        shape_prior = None
-        coord = config.head.coord
-        needs_prior = isinstance(
-            coord, (ShapePriorCoordConfig, ShapeSimCCCoordConfig, GeoSimCCCoordConfig)
-        ) or (
-            isinstance(coord, HeatmapCoordConfig) and coord.data_prior
-        )
-        if needs_prior:
-            from pathlib import Path
+        from fubio.data.shape_prior import ShapePrior
 
-            from fubio.data.shape_prior import ShapePrior
-
-            prior_path = (
-                Path(coord.prior_path)
-                if isinstance(coord, ShapePriorCoordConfig)
-                else config.loss.shape_prior_path
+        prior_path = config.loss.shape_prior_path
+        if not prior_path.exists():
+            raise FileNotFoundError(
+                f"Shape prior not found: {prior_path}\n"
+                f"Build with: uv run python -m fubio.data.build_shape_prior"
             )
-            if not prior_path.exists():
-                raise FileNotFoundError(
-                    f"Shape prior not found: {prior_path}\n"
-                    f"Build with: uv run python -m fubio.data.build_shape_prior"
-                )
-            shape_prior = ShapePrior.model_validate_json(prior_path.read_text())
+        shape_prior = ShapePrior.model_validate_json(prior_path.read_text())
 
-        # [P1: Anchor query position] load shape prior for anchor init even if
-        # the coord predictor doesn't need it (e.g. SimCC mode). Soft: if the
-        # file doesn't exist, anchors fall back to zeros — no hard failure.
-        if shape_prior is None:
-            from pathlib import Path
-
-            from fubio.data.shape_prior import ShapePrior
-
-            anchor_path = config.loss.shape_prior_path
-            if anchor_path.exists():
-                shape_prior = ShapePrior.model_validate_json(anchor_path.read_text())
-
-        _use_sup = config.loss.lambda_supportive > 0 or config.loss.lambda_evidence > 0
         self.model = FUBioModel(
             backbone_name=config.backbone.name,
             d_model=config.d_model,
@@ -175,18 +133,12 @@ class FUBioModule(L.LightningModule):
             n_decoder_layers=config.decoder.n_layers,
             n_head_layers=config.head.n_layers,
             n_inst=config.head.n_inst,
-            use_uncertainty=config.loss.use_uncertainty,
             derive_bbox=config.head.derive_bbox,
-            use_affine=config.head.use_affine,
-            return_intermediate=self._miro_enabled,
             coord_config=config.head.coord,
             shape_prior=shape_prior,
             neck_config=config.neck,
             neck_dropout=config.neck_dropout,
             dropout=config.decoder.dropout,
-            conf_mlp_layers=config.head.conf_mlp_layers,
-            input_size=max(config.backbone.input_size),
-            use_supportive=_use_sup,
         )
         self.matcher = PerTaskMatcher(
             cost_conf=config.matcher.cost_conf,
@@ -220,23 +172,6 @@ class FUBioModule(L.LightningModule):
                     f"_canon_basis_{tid}", torch.tensor(tp.canonical_basis, dtype=torch.float32)
                 )
                 self._canon_tasks.add(tid)
-
-        # MIRO: frozen backbone copy + variational encoders
-        if self._miro_enabled:
-            from copy import deepcopy
-
-            from fubio.train.regularizer import MIROEncoders, build_miro_encoders
-
-            self._frozen_backbone = deepcopy(self.model.backbone)
-            self._frozen_backbone.eval()
-            for p in self._frozen_backbone.parameters():
-                p.requires_grad = False
-            _input_w, _input_h = config.backbone.input_size
-            self._miro_encoders: MIROEncoders = build_miro_encoders(
-                self.model.backbone,
-                (_input_h, _input_w),  # build_miro_encoders expects (H, W)
-                config.miro,
-            )
 
         self._train_mre = MREMetric()
         self._train_param_mae = ParamMAEMetric()
@@ -280,7 +215,7 @@ class FUBioModule(L.LightningModule):
         teacher.eval()
         teacher.requires_grad_(False)
         # Store via object.__setattr__ to AVOID nn.Module registration.
-        # This keeps the teacher out of state_dict(), SWAD snapshots, and
+        # This keeps the teacher out of state_dict() and
         # recursive train()/eval() calls. Device placement is handled
         # manually in _ensure_teacher_device().
         object.__setattr__(self, "_teacher_model", teacher)
@@ -456,32 +391,13 @@ class FUBioModule(L.LightningModule):
         zero = torch.tensor(0.0, device=device)
         neg_smooth = self.config.loss.neg_label_smooth
         lambda_mil = self.config.semi.lambda_mil
-        lambda_conf_rank = self.config.loss.lambda_conf_rank
         lambda_heatmap = self.config.loss.lambda_heatmap
-        lambda_simcc = self.config.loss.lambda_simcc
         lambda_shape_cons = self.config.loss.lambda_shape_consistency
-        lambda_supportive = self.config.loss.lambda_supportive
-        lambda_evidence = self.config.loss.lambda_evidence
         lambda_geo_consistency = self.config.loss.lambda_geo_consistency
         lambda_geo_constraint = self.config.loss.lambda_geo_constraint
-        # Both readouts route their spatial distribution to TaskOutput.heatmap,
-        # but they are supervised at different widths on purpose: HeatmapPredictor
-        # owns the final coordinate, GeoSimCC's stage 1 only has to land in the
-        # right cell (stage 3 refines), so its target is deliberately narrower.
-        if isinstance(self.config.head.coord, HeatmapCoordConfig):
-            heatmap_sigma = self.config.head.coord.gaussian_sigma
-        elif isinstance(self.config.head.coord, GeoSimCCCoordConfig):
-            heatmap_sigma = self.config.head.coord.coarse_sigma_cells
-        else:
-            heatmap_sigma = 1.5
-        # [P2: SimCC readout] precompute bins/sigma for SimCC loss
-        simcc_n_bins = 0
-        simcc_sigma = 5.0
-        if isinstance(self.config.head.coord, (SimCCCoordConfig, ShapeSimCCCoordConfig)):
-            simcc_n_bins = int(
-                max(self.config.backbone.input_size) * self.config.head.coord.split_ratio
-            )
-            simcc_sigma = self.config.head.coord.sigma_bins
+        # GeoSimCC's stage 1 only has to land in the right cell (stage 3
+        # refines), so its heatmap target is deliberately narrow.
+        heatmap_sigma = self.config.head.coord.coarse_sigma_cells
 
         # -- Supervision status per (image, task) --
         # Determines which loss terms apply to each query:
@@ -501,14 +417,11 @@ class FUBioModule(L.LightningModule):
 
         total_bbox = zero
         total_conf = zero
-        total_conf_rank = zero
         total_lm = zero
         total_param = zero
         total_mil = zero
         total_heatmap = zero
-        total_simcc = zero
         total_shape_cons = zero
-        total_evidence = zero
         total_geo = zero
         total_geo_constraint = zero
         # Per-component accumulators for separate logging
@@ -556,15 +469,6 @@ class FUBioModule(L.LightningModule):
                 if tdef.task_int in unlabeled_tasks[b] and tdef.task_int not in labeled_tasks[b]
             ]
 
-            # Ranking supervision on top of per-slot calibration: focal loss says
-            # "is this slot a hit?", ranking says "is this slot the BEST one?" —
-            # and argmax(conf) at serving time depends only on the latter.
-            if lambda_conf_rank > 0:
-                total_conf_rank = total_conf_rank + conf_ranking_loss(
-                    task_out.conf.squeeze(-1),
-                    [list(q_idx) for q_idx, _ in task_matched],
-                )
-
             conf_logits = task_out.conf.squeeze(-1)  # (B, n_inst)
             if mil_rows:
                 keep = torch.ones(B, dtype=torch.bool, device=device)
@@ -596,7 +500,6 @@ class FUBioModule(L.LightningModule):
             gt_lm_np: list[np.ndarray] = []
             gt_sup_np: list[np.ndarray] = []
             gt_vis_np: list[np.ndarray] = []
-            gt_evi_np: list[np.ndarray] = []
             orig_hw_np: list[np.ndarray] = []
             b_indices: list[int] = []
             q_indices: list[int] = []
@@ -610,8 +513,6 @@ class FUBioModule(L.LightningModule):
                     gt_lm_np.append(inst["keypoints"])
                     gt_sup_np.append(inst["supervised_mask"])
                     gt_vis_np.append(inst["visible_mask"])
-                    evi_default = np.zeros_like(inst["supervised_mask"], dtype=np.int64)
-                    gt_evi_np.append(inst.get("evidence_mask", evi_default))
                     orig_hw_np.append(inst["original_hw"])
                     b_indices.append(b)
                     q_indices.append(qi)
@@ -651,33 +552,9 @@ class FUBioModule(L.LightningModule):
             total_bbox = total_bbox + box_losses["loss_box_l1"] + box_losses["loss_box_ciou"]
             mask = sup_mask & vis_mask
 
-            # Scored/supportive split: separate loss normalization
-            _has_scored_mask = hasattr(self.model.tasks[tid], "scored_mask")
-            if _has_scored_mask:
-                scored_buf = self.model.tasks[tid].scored_mask  # (K_total,) bool
-                scored_m = mask & scored_buf.unsqueeze(0)
-                sup_lm_m = mask & ~scored_buf.unsqueeze(0)
-            else:
-                scored_m = mask
-                sup_lm_m = torch.zeros_like(mask)
+            total_lm = total_lm + landmark_loss(pred_lm, gt_lm, mask)
 
-            loss_lm_scored = landmark_loss(
-                pred_lm, gt_lm, scored_m,
-                beta=self.config.loss.landmark_beta,
-            )
-            loss_lm_sup = landmark_loss(
-                pred_lm, gt_lm, sup_lm_m,
-                beta=self.config.loss.landmark_beta,
-            )
-            total_lm = total_lm + loss_lm_scored + lambda_supportive * loss_lm_sup
-
-            total_param = total_param + param_loss(
-                pred_lm,
-                gt_lm,
-                tid,
-                vis_mask,
-                beta=self.config.loss.landmark_beta,
-            )
+            total_param = total_param + param_loss(pred_lm, gt_lm, tid, vis_mask)
 
             lambda_angle_sign = self.config.loss.lambda_angle_sign
             if lambda_geo_constraint > 0 or lambda_angle_sign > 0:
@@ -703,32 +580,10 @@ class FUBioModule(L.LightningModule):
 
             if lambda_heatmap > 0 and task_out.heatmap is not None:
                 pred_heat = task_out.heatmap[b_indices, q_indices]  # (N_matched, K_total, S)
-                h_scored = heatmap_loss(
-                    pred_heat, gt_lm, scored_m, spatial_shape,
+                total_heatmap = total_heatmap + heatmap_loss(
+                    pred_heat, gt_lm, mask, spatial_shape,
                     sigma_cells=heatmap_sigma,
                 )
-                h_sup = heatmap_loss(
-                    pred_heat, gt_lm, sup_lm_m, spatial_shape,
-                    sigma_cells=heatmap_sigma,
-                )
-                total_heatmap = total_heatmap + h_scored + lambda_supportive * h_sup
-
-            # [P2: SimCC readout] distribution-level supervision on 1D bins
-            if lambda_simcc > 0 and task_out.simcc_logits is not None:
-                sim_x, sim_y = task_out.simcc_logits
-                s_scored = simcc_loss(
-                    sim_x[b_indices, q_indices],
-                    sim_y[b_indices, q_indices],
-                    gt_lm, scored_m, simcc_n_bins,
-                    sigma_bins=simcc_sigma,
-                )
-                s_sup = simcc_loss(
-                    sim_x[b_indices, q_indices],
-                    sim_y[b_indices, q_indices],
-                    gt_lm, sup_lm_m, simcc_n_bins,
-                    sigma_bins=simcc_sigma,
-                )
-                total_simcc = total_simcc + s_scored + lambda_supportive * s_sup
 
             if lambda_shape_cons > 0 and tid in self._canon_tasks:
                 total_shape_cons = total_shape_cons + shape_consistency_loss(
@@ -738,21 +593,6 @@ class FUBioModule(L.LightningModule):
                     getattr(self, f"_canon_basis_{tid}"),
                 )
 
-            # Evidence loss: BCE on per-landmark evidence prediction
-            if lambda_evidence > 0 and task_out.evidence is not None:
-                gt_evi = torch.tensor(
-                    np.stack(gt_evi_np), dtype=torch.float32, device=device,
-                )
-                pred_evi = task_out.evidence[b_indices, q_indices]
-                evi_mask = sup_mask & vis_mask
-                evi_bce = F.binary_cross_entropy_with_logits(
-                    pred_evi, gt_evi, reduction="none",
-                )
-                total_evidence = total_evidence + (
-                    (evi_bce * evi_mask.float()).sum()
-                    / evi_mask.float().sum().clamp(min=1)
-                )
-
             # Geometric consistency: compute supportive from predicted scored
             # landmarks via differentiable geometry, compare with GT supportive.
             # Gradient flows directly to scored predictions through the geometry.
@@ -760,8 +600,7 @@ class FUBioModule(L.LightningModule):
                 derived_sup = compute_supportive_torch(tid, pred_lm)
                 if derived_sup is not None and _mask_sup_for_geo.any():
                     total_geo = total_geo + landmark_loss(
-                        derived_sup, _gt_sup_for_geo, _mask_sup_for_geo,
-                        beta=self.config.loss.landmark_beta,
+                        derived_sup, _gt_sup_for_geo, _mask_sup_for_geo
                     )
                     n_tasks_with_geo += 1
 
@@ -830,75 +669,14 @@ class FUBioModule(L.LightningModule):
         total = (
             self.config.loss.lambda_bbox * total_bbox / denom
             + self.config.loss.lambda_conf * total_conf / conf_denom
-            + lambda_conf_rank * total_conf_rank / denom
             + self.config.loss.lambda_land * total_lm / denom
             + self.config.loss.lambda_param * total_param / denom
             + lambda_mil * total_mil / mil_denom
             + lambda_heatmap * total_heatmap / denom
-            + lambda_simcc * total_simcc / denom
             + lambda_shape_cons * total_shape_cons / denom
-            + lambda_evidence * total_evidence / denom
             + lambda_geo_consistency * total_geo / geo_denom
             + lambda_geo_constraint * total_geo_constraint / gc_denom
         )
-
-        # The three blocks below need no GT and would therefore silently start
-        # acting on the unlabeled pass as well. Held to the labeled pass so that
-        # enabling semi-supervision changes the objective by the semi-supervised
-        # terms alone; extending any of them to unlabeled data is a deliberate
-        # experiment, not a side effect of loading it.
-        all_sample_losses = not unlabeled_pass
-
-        # Shape residual loss — applied to ALL samples, not gated on GT
-        total_shape = zero
-        lambda_shape = self.config.loss.lambda_shape
-        if lambda_shape > 0 and all_sample_losses:
-            n_shape = 0
-            for task_out in results.values():
-                if task_out.residual is not None:
-                    total_shape = total_shape + shape_residual_loss(task_out.residual)
-                    n_shape += 1
-            if n_shape > 0:
-                total_shape = total_shape / n_shape
-            total = total + lambda_shape * total_shape
-
-        # AffineHead orthogonality regularization — applied to ALL samples
-        total_ortho = zero
-        lambda_ortho = self.config.loss.lambda_ortho
-        if lambda_ortho > 0 and all_sample_losses:
-            n_ortho = 0
-            for task_out in results.values():
-                if task_out.affine_T is not None:
-                    total_ortho = total_ortho + ortho_regularization(task_out.affine_T)
-                    n_ortho += 1
-            if n_ortho > 0:
-                total_ortho = total_ortho / n_ortho
-            total = total + lambda_ortho * total_ortho
-
-        # Instance repulsion: push UNMATCHED queries off the matched one. Matched
-        # slots are detached so the penalty never drags a correct prediction away.
-        total_repulsion = zero
-        lambda_repulsion = self.config.loss.lambda_repulsion
-        if lambda_repulsion > 0 and all_sample_losses:
-            total_repulsion = instance_repulsion_loss(
-                results,
-                matched_queries={
-                    tid: [list(q_idx) for q_idx, _ in matched[tid]] for tid in results
-                },
-            )
-            total = total + lambda_repulsion * total_repulsion
-
-        # MIRO: regularize fine-tuned backbone toward frozen pretrained features
-        total_miro = zero
-        if self._miro_enabled and stage == "train":
-            from fubio.train.regularizer import miro_loss
-
-            post_feats = model_out.backbone_out.features
-            with torch.no_grad():
-                pre_out = self._frozen_backbone(images)
-            pre_feats = pre_out.features
-            total_miro = miro_loss(pre_feats, post_feats, self._miro_encoders)
-            total = total + self.config.miro.lambda_miro * total_miro
 
         sync = stage == "val"
         self.log(f"{stage}/loss", total, prog_bar=True, sync_dist=sync)
@@ -906,18 +684,12 @@ class FUBioModule(L.LightningModule):
         self.log(f"{stage}/loss_conf", total_conf / conf_denom, sync_dist=sync)
         self.log(f"{stage}/loss_lm", total_lm / denom, sync_dist=sync)
         self.log(f"{stage}/loss_param", total_param / denom, sync_dist=sync)
-        if lambda_conf_rank > 0:
-            self.log(f"{stage}/loss_conf_rank", total_conf_rank / denom, sync_dist=sync)
         if lambda_mil > 0:
             self.log(f"{stage}/loss_mil", total_mil / mil_denom, sync_dist=sync)
         if lambda_heatmap > 0:
             self.log(f"{stage}/loss_heatmap", total_heatmap / denom, sync_dist=sync)
-        if lambda_simcc > 0:
-            self.log(f"{stage}/loss_simcc", total_simcc / denom, sync_dist=sync)
         if lambda_shape_cons > 0:
             self.log(f"{stage}/loss_shape_cons", total_shape_cons / denom, sync_dist=sync)
-        if lambda_evidence > 0:
-            self.log(f"{stage}/loss_evidence", total_evidence / denom, sync_dist=sync)
         if lambda_geo_consistency > 0:
             self.log(f"{stage}/loss_geo_consistency", total_geo / geo_denom, sync_dist=sync)
         if lambda_geo_constraint > 0:
@@ -934,14 +706,6 @@ class FUBioModule(L.LightningModule):
                 self.log(
                     f"{stage}/loss_gc_angle_sign", total_gc_angle_sign / gc_denom, sync_dist=sync
                 )
-        if lambda_shape > 0:
-            self.log(f"{stage}/loss_shape", total_shape, sync_dist=sync)
-        if lambda_ortho > 0:
-            self.log(f"{stage}/loss_ortho", total_ortho, sync_dist=sync)
-        if lambda_repulsion > 0:
-            self.log(f"{stage}/loss_repulsion", total_repulsion, sync_dist=sync)
-        if self._miro_enabled:
-            self.log(f"{stage}/loss_miro", total_miro, sync_dist=sync)
 
         if return_eq_refs:
             eq_refs: dict[str, Tensor] = {}
@@ -1107,10 +871,7 @@ class FUBioModule(L.LightningModule):
                     student_scored = student_lm[:, 0, :K_scored]
                     target_scored = pseudo_target[:, 0, :K_scored]
                     vis = pseudo_valid[:, 0, :K_scored]
-                    pp = param_loss(
-                        student_scored, target_scored, tid, vis,
-                        beta=self.config.loss.landmark_beta,
-                    )
+                    pp = param_loss(student_scored, target_scored, tid, vis)
                     total_pseudo_param = total_pseudo_param + task_weight * pp
                     n_tasks_param += 1
 
@@ -1239,7 +1000,7 @@ class FUBioModule(L.LightningModule):
                     if len(bb_lrs) > 1:
                         self.log("lr/backbone_min", min(bb_lrs))
                 for g in opt.param_groups:
-                    if g.get("name") in ("neck", "decoder", "heads", "miro"):
+                    if g.get("name") in ("neck", "decoder", "heads"):
                         self.log(f"lr/{g['name']}", g["lr"])
         return loss
 
@@ -1383,15 +1144,6 @@ class FUBioModule(L.LightningModule):
             param_groups, n_backbone_groups = self._head_tune_param_groups(opt_cfg, ht)
         else:
             param_groups, n_backbone_groups = self._full_param_groups(opt_cfg)
-        # MIRO variance encoder params — learn at neck LR
-        if self._miro_enabled:
-            param_groups.append(
-                {
-                    "params": list(self._miro_encoders.parameters()),
-                    "lr": opt_cfg.lr_neck,
-                    "name": "miro",
-                }
-            )
         optimizer = AdamW(
             param_groups,
             weight_decay=opt_cfg.weight_decay,

@@ -11,9 +11,6 @@ dependencies = [
     # --- Core DL ---
     "torch>=2.5",
     "torchvision>=0.20",
-    "timm>=1.0.15",          # DINOv2 / ConvNeXt V2 backbones
-    # --- Medical (support role: Bundle packaging + optional metrics) ---
-    "monai>=1.4",
     # --- Augmentation ---
     "albumentations>=2.0",   # keypoint-aware geometric aug (dataloading stage)
     "kornia>=0.7",           # differentiable on-GPU transforms (EC consistency loss)
@@ -21,25 +18,19 @@ dependencies = [
     # --- Data ---
     "numpy>=2.1",
     "polars>=1.0",           # primary dataframe (schema-strict; catches CSV quirks)
+    "pandas>=2.0",           # build_cache manifest hash (stable CSV serialization)
     "pyarrow>=17.0",         # parquet manifest + polars<->pandas bridge
     "scipy>=1.14",           # Hungarian matching (train/matcher.py) — reaches serving via FUBioModule
     # --- Config ---
     "pydantic>=2.9",
     "pydantic-settings>=2.5",
     "pyyaml>=6.0",           # config loading in train/train.py
-    # --- Metrics / serialization ---
-    "torchmetrics>=1.5",
-    "safetensors>=0.4",
-    # --- Tracking / CLI / notebook ---
+    # --- Tracking / CLI ---
     "wandb>=0.18",
     "typer>=0.12",
-    "marimo>=0.9",
-    "plotly>=6.0",
     "tqdm>=4.66",            # inference + submission progress
     # --- Training ---
     "lightning>=2.4",
-    "torchinfo>=1.8.0",
-    "matplotlib>=3.11.1",
 ]
 
 [dependency-groups]
@@ -49,7 +40,6 @@ dev = [
     "hypothesis>=6.100",     # property-based tests (equivariance of EC transforms)
     "pyright>=1.1.380",
     "pre-commit>=4.0",
-    "streamlit>=1.59",       # viewer
 ]
 
 [build-system]

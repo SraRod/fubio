@@ -72,19 +72,6 @@ def load_module(
 
     raw = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     hp = dict(raw["hyper_parameters"])
-    # Patch use_affine + ShapeSimCC incompatibility (pre-validator checkpoints).
-    head = hp.get("head", {})
-    coord_mode = head.get("coord", {}).get("mode", "")
-    if head.get("use_affine") and coord_mode in ("simcc", "shape_simcc"):
-        hp["head"] = {**head, "use_affine": False}
-        loss = hp.get("loss", {})
-        if loss.get("lambda_ortho", 0) > 0:
-            hp["loss"] = {**loss, "lambda_ortho": 0.0}
-        logger.warning(
-            "Patched use_affine=True→False for %s checkpoint "
-            "(inference-only, no effect on predictions)",
-            coord_mode,
-        )
     config = ExperimentConfig(**hp)
     # weights_only=False: checkpoint contains PosixPath in hparams
     module = FUBioModule.load_from_checkpoint(

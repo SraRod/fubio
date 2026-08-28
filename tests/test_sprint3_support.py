@@ -1,4 +1,4 @@
-"""Tests for Sprint 3 support modules: regularizer, callbacks, schedule."""
+"""Tests for Sprint 3 support modules: callbacks, schedule."""
 
 from __future__ import annotations
 
@@ -6,106 +6,8 @@ import pytest
 import torch
 import torch.nn as nn
 
-from fubio.train.callbacks import CSVCallback, SWADCallback
-from fubio.train.regularizer import (
-    MeanEncoder,
-    MIROEncoders,
-    VarianceEncoder,
-    miro_loss,
-)
+from fubio.train.callbacks import CSVCallback
 from fubio.train.schedule import PhaseScheduler
-
-# ======================================================================
-# regularizer.py
-# ======================================================================
-
-
-class TestMeanEncoder:
-    def test_identity(self) -> None:
-        enc = MeanEncoder((2, 16, 64))
-        x = torch.randn(2, 16, 64)
-        assert torch.equal(enc(x), x)
-
-
-class TestVarianceEncoder:
-    def test_vit_shape(self) -> None:
-        """ViT (B, N, C) input -> output broadcasts to (1, 1, C)."""
-        enc = VarianceEncoder((2, 197, 768), channelwise=True)
-        out = enc(torch.randn(2, 197, 768))
-        assert out.shape == (1, 1, 768)
-
-    def test_cnn_shape(self) -> None:
-        """CNN (B, C, H, W) input -> output broadcasts to (1, C, 1, 1)."""
-        enc = VarianceEncoder((2, 256, 14, 14), channelwise=True)
-        out = enc(torch.randn(2, 256, 14, 14))
-        assert out.shape == (1, 256, 1, 1)
-
-    def test_positive_output(self) -> None:
-        """Softplus ensures positive variance."""
-        enc = VarianceEncoder((4, 100, 64))
-        out = enc(torch.randn(4, 100, 64))
-        assert (out > 0).all()
-
-    def test_init_value(self) -> None:
-        """Initial variance ≈ requested init value."""
-        init = 0.5
-        enc = VarianceEncoder((1, 10, 32), init=init)
-        out = enc(torch.zeros(1, 10, 32))
-        assert abs(out.mean().item() - init) < 1e-4
-
-    def test_unsupported_ndim_raises(self) -> None:
-        with pytest.raises(ValueError, match="channelwise"):
-            VarianceEncoder((64,), channelwise=True)
-
-
-class TestMIROEncoders:
-    def test_forward_structure(self) -> None:
-        """Returns (means, variances) with correct lengths."""
-        shapes = [(2, 197, 768), (2, 197, 768)]
-        encs = MIROEncoders(shapes)
-        feats = [torch.randn(*s) for s in shapes]
-        means, variances = encs(feats)
-        assert len(means) == 2
-        assert len(variances) == 2
-        # Means are identity
-        assert torch.equal(means[0], feats[0])
-        # Variances are positive
-        assert (variances[0] > 0).all()
-
-
-class TestMIROLoss:
-    def test_returns_scalar(self) -> None:
-        """miro_loss returns a scalar > 0."""
-        shapes = [(2, 50, 64)]
-        encs = MIROEncoders(shapes)
-        pre = [torch.randn(2, 50, 64)]
-        post = [torch.randn(2, 50, 64)]
-        loss = miro_loss(pre, post, encs)
-        assert loss.ndim == 0
-        assert loss.item() > 0
-
-    def test_gradient_flows(self) -> None:
-        """Loss is differentiable w.r.t. variance encoder params."""
-        shapes = [(1, 10, 32)]
-        encs = MIROEncoders(shapes)
-        pre = [torch.randn(1, 10, 32)]
-        post = [torch.randn(1, 10, 32)]
-        loss = miro_loss(pre, post, encs)
-        loss.backward()
-        var_enc = encs.var_encoders[0]
-        assert var_enc.bias.grad is not None
-        assert var_enc.bias.grad.abs().sum() > 0
-
-    def test_zero_when_identical(self) -> None:
-        """Loss is minimal when pre == post and mean encoder is identity."""
-        shapes = [(1, 10, 32)]
-        encs = MIROEncoders(shapes)
-        feat = [torch.randn(1, 10, 32)]
-        # Same features → loss ≈ only the log(var) term, which is small
-        loss = miro_loss(feat, feat, encs)
-        # Just check it runs; the value isn't literally zero because of log(var)
-        assert loss.isfinite()
-
 
 # ======================================================================
 # callbacks.py
@@ -118,26 +20,6 @@ class TestCSVCallback:
         cb = CSVCallback()
         assert cb is not None
         assert cb._csv_path is None
-
-
-class TestSWADCallback:
-    def test_start_after_epoch(self) -> None:
-        """Nothing is accumulated before any hook fires.
-
-        Behavioural coverage of the averaging window, the convergence rule and
-        the on_train_end persistence lives in tests/test_swad.py.
-        """
-        cb = SWADCallback(start_after_epoch=5, n_converge=2)
-        assert len(cb._recent) == 0
-        assert cb._converged is False
-        assert cb._avg_model is None
-
-    def test_default_params(self) -> None:
-        cb = SWADCallback()
-        assert cb.n_converge == 3
-        assert cb.n_tolerance == 6
-        assert cb.tolerance_ratio == 0.3
-        assert cb.start_after_epoch == 0
 
 
 # ======================================================================

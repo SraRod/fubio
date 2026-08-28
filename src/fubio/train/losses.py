@@ -2,14 +2,14 @@
 
 bbox_loss: L1 + CIoU on matched query-GT pairs.
 conf_focal_loss: binary focal loss — matched queries are positive, rest negative.
-landmark_loss: SmoothL1 / L1 (or GaussianNLL with uncertainty) on per-task landmarks.
+landmark_loss: L1 on per-task landmarks.
 heatmap_loss: soft cross-entropy vs Gaussian target on the affinity distribution.
-param_loss: SmoothL1 on derived clinical parameters.
+param_loss: scale-normalized L1 on derived clinical parameters.
 mil_loss: MIL bag-level loss for task-known unlabeled images.
 equivariance_loss: landmark consistency under known geometric transforms.
-shape_residual_loss: L2 penalty on shape prior residual δ.
-ortho_regularization: soft orthogonality on AffineHead's rotation submatrix.
-instance_repulsion_loss: pairwise bbox IoU penalty across instance slots.
+pseudo_label_loss: confidence-weighted L1 distillation from the EMA teacher.
+geometric_constraint_loss + the ellipse/chamber terms: anatomy validity penalties.
+shape_consistency_loss: residual outside the PCA shape subspace.
 
 Upstream: train/matcher.py (per-task matched indices), evaluation/geometry.py,
           models/coord_predictors.py (normalized_grid — shared grid convention).
@@ -149,50 +149,6 @@ def conf_focal_loss(
     return (alpha_t * focal_weight * bce).mean()
 
 
-def conf_ranking_loss(
-    conf_logits: Tensor,
-    matched_queries: list[list[int]],
-) -> Tensor:
-    """Listwise ranking loss: matched queries must outrank unmatched ones.
-
-    conf_focal_loss calibrates each slot independently ("is this slot a hit?"),
-    which does not constrain the ORDER of the slots — and order is what
-    inference uses, since serving emits argmax(conf). Measured 2026-07-25 on
-    R17: argmax picked the lowest-error instance only 46% of the time on
-    fetal_femur (n=90) and 62% on FUGC (n=39), while agreeing >=92% elsewhere.
-    Ranking is therefore the quantity to supervise directly.
-
-    Loss per image = -[logsumexp(matched) - logsumexp(all)], i.e. the negative
-    log of the probability mass the softmax assigns to the matched set. With a
-    single matched query this is exactly cross-entropy against that query; with
-    several it raises the whole matched set above the unmatched ones without
-    imposing an arbitrary order among genuine instances.
-
-    Args:
-        conf_logits: (B, N_inst) raw logits for one task.
-        matched_queries: per image, the Hungarian-matched query indices. Images
-            with no GT for this task contribute nothing.
-
-    Returns:
-        Scalar mean over images that have at least one matched query.
-    """
-    device = conf_logits.device
-    losses: list[Tensor] = []
-
-    for b, q_idx in enumerate(matched_queries):
-        # All slots matched → the ratio is identically 1 and the gradient is
-        # zero; skip rather than feed log(1) into the mean and dilute it.
-        if not q_idx or len(q_idx) >= conf_logits.shape[1]:
-            continue
-        row = conf_logits[b]
-        idx = torch.as_tensor(q_idx, dtype=torch.long, device=device)
-        losses.append(torch.logsumexp(row, dim=0) - torch.logsumexp(row[idx], dim=0))
-
-    if not losses:
-        return torch.tensor(0.0, device=device)
-    return torch.stack(losses).mean()
-
-
 # ---------------------------------------------------------------------------
 # Landmark loss
 # ---------------------------------------------------------------------------
@@ -202,22 +158,17 @@ def landmark_loss(
     pred_xy: Tensor,
     gt_xy: Tensor,
     mask: Tensor,
-    beta: float = 1.0,
-    sigma: Tensor | None = None,
 ) -> Tensor:
-    """Landmark regression loss — per-element mean over visible landmarks.
+    """Landmark L1 loss — per-element mean over visible landmarks.
 
-    Uses SmoothL1 by default; switches to GaussianNLL when sigma provided.
-    beta <= 0 selects plain L1 (constant gradient) — preferred for coords in
-    [0,1], where SmoothL1's quadratic regime (error << beta always) shrinks the
-    gradient as predictions approach the target.
+    Plain L1 (constant gradient) on purpose: coords live in [0,1], where
+    SmoothL1's quadratic regime (error << beta always) shrinks the gradient
+    as predictions approach the target.
 
     Args:
         pred_xy: (N, K_task, 2) predicted normalized coords.
         gt_xy: (N, K_task, 2) ground truth normalized coords.
         mask: (N, K_task) bool — only supervised & visible landmarks.
-        beta: SmoothL1 beta; <= 0 → plain L1.
-        sigma: (N, K_task, 2) variance if uncertainty head is enabled.
 
     Returns:
         Scalar loss.
@@ -226,26 +177,7 @@ def landmark_loss(
         return torch.tensor(0.0, device=pred_xy.device, dtype=pred_xy.dtype)
 
     mask_2d = mask.unsqueeze(-1).expand_as(pred_xy)
-
-    if sigma is not None:
-        variance = sigma.clamp(min=1e-6)
-        loss = F.gaussian_nll_loss(
-            pred_xy[mask_2d],
-            gt_xy[mask_2d],
-            variance[mask_2d],
-            reduction="mean",
-        )
-    elif beta <= 0:
-        loss = F.l1_loss(pred_xy[mask_2d], gt_xy[mask_2d], reduction="mean")
-    else:
-        loss = F.smooth_l1_loss(
-            pred_xy[mask_2d],
-            gt_xy[mask_2d],
-            beta=beta,
-            reduction="mean",
-        )
-
-    return loss
+    return F.l1_loss(pred_xy[mask_2d], gt_xy[mask_2d], reduction="mean")
 
 
 def heatmap_loss(
@@ -292,55 +224,6 @@ def heatmap_loss(
     log_pred = (pred_heat.clamp(min=1e-12)).log()
     ce = -(target * log_pred).sum(dim=-1)  # (N, K)
     return ce[mask].mean()
-
-
-def simcc_loss(
-    x_logits: Tensor,
-    y_logits: Tensor,
-    gt_xy: Tensor,
-    mask: Tensor,
-    n_bins: int,
-    sigma_bins: float = 5.0,
-) -> Tensor:
-    """[P2: SimCC readout] Gaussian soft-label CE on 1D bin distributions.
-
-    Each coordinate axis gets its own 1D Gaussian target centered at the GT
-    bin position. Distribution-level supervision forces the model to produce
-    well-shaped probability peaks, not just correct centroids — the shape
-    carries uncertainty information and helps soft-argmax stability.
-
-    Args:
-        x_logits: (N, K, n_bins) raw logits for x-axis.
-        y_logits: (N, K, n_bins) raw logits for y-axis.
-        gt_xy: (N, K, 2) GT normalized coords in [0, 1].
-        mask: (N, K) bool — supervised & visible.
-        n_bins: number of bins per axis.
-        sigma_bins: Gaussian width in bins.
-
-    Returns:
-        Scalar loss.
-    """
-    if not mask.any():
-        return torch.tensor(0.0, device=x_logits.device, dtype=x_logits.dtype)
-
-    # Pixel-center convention: bin i represents interval [i/n, (i+1)/n],
-    # centered at (i+0.5)/n. Target is the continuous bin position.
-    bins = torch.arange(n_bins, device=gt_xy.device, dtype=torch.float32) + 0.5
-
-    gt_x_bin = gt_xy[..., 0] * n_bins  # (N, K) — continuous position in bin space
-    gt_y_bin = gt_xy[..., 1] * n_bins
-
-    target_x = torch.exp(-0.5 * ((bins - gt_x_bin.unsqueeze(-1)) / sigma_bins) ** 2)
-    target_x = target_x / target_x.sum(dim=-1, keepdim=True).clamp(min=1e-12)
-    target_y = torch.exp(-0.5 * ((bins - gt_y_bin.unsqueeze(-1)) / sigma_bins) ** 2)
-    target_y = target_y / target_y.sum(dim=-1, keepdim=True).clamp(min=1e-12)
-
-    log_pred_x = F.log_softmax(x_logits, dim=-1)
-    log_pred_y = F.log_softmax(y_logits, dim=-1)
-    ce_x = -(target_x * log_pred_x).sum(dim=-1)  # (N, K)
-    ce_y = -(target_y * log_pred_y).sum(dim=-1)
-
-    return (ce_x[mask].mean() + ce_y[mask].mean()) / 2
 
 
 def shape_consistency_loss(
@@ -396,11 +279,10 @@ def param_loss(
     gt_landmarks: Tensor,
     task_id: str,
     visible_mask: Tensor,
-    beta: float = 1.0,
 ) -> Tensor:
-    """Clinical parameter loss: scale-normalized Huber between derived params.
+    """Clinical parameter loss: scale-normalized L1 between derived params.
 
-    Each parameter's SmoothL1 is divided by the GT magnitude, making the loss
+    Each parameter's L1 is divided by the GT magnitude, making the loss
     approximately relative error. This ensures commensurability across formula
     types: AOP_angle (~1.5 rad), HC_circumference (~1.2), and distances (~0.1)
     all contribute proportionally to their relative prediction quality.
@@ -410,7 +292,6 @@ def param_loss(
         gt_landmarks: (N, K_task, 2) GT landmarks.
         task_id: task string id (e.g. "HC", "A4C").
         visible_mask: (N, K_task) bool — landmark visibility.
-        beta: SmoothL1 transition point.
 
     Returns:
         Scalar loss (0 if task has no params or all params are NaN).
@@ -429,9 +310,7 @@ def param_loss(
         if not valid.any():
             continue
         scale = gt_val[valid].abs().mean().clamp(min=0.01)
-        losses.append(
-            F.smooth_l1_loss(pred_val[valid], gt_val[valid], beta=beta, reduction="mean") / scale
-        )
+        losses.append(F.l1_loss(pred_val[valid], gt_val[valid], reduction="mean") / scale)
 
     if not losses:
         return torch.tensor(0.0, device=pred_landmarks.device)
@@ -574,108 +453,6 @@ def equivariance_loss(
     w = conf_ref.detach().squeeze(-1).sigmoid()  # (B, N)
     weighted = l2 * w.unsqueeze(-1)  # (B, N, K)
     return weighted.sum() / l2.numel()
-
-
-def ortho_regularization(affine_T: Tensor) -> Tensor:
-    """Soft orthogonality penalty on AffineHead's 2×2 rotation submatrix.
-
-    Constrains R toward a similarity transform (rotation + uniform scale)
-    while allowing shear when data justifies it (inter-individual anatomical
-    variation). Penalty: ||RᵀR - det(R)·I||².
-
-    Args:
-        affine_T: (B, N, 2, 3) predicted affine transforms.
-
-    Returns:
-        Scalar loss (mean over batch and instances).
-    """
-    R = affine_T[..., :2]  # (B, N, 2, 2) — rotation/scale/shear submatrix
-    RtR = torch.einsum("...ji,...jk->...ik", R, R)  # (B, N, 2, 2)
-    det = R[..., 0, 0] * R[..., 1, 1] - R[..., 0, 1] * R[..., 1, 0]  # (B, N)
-    eye = torch.eye(2, device=R.device, dtype=R.dtype)
-    target = det.unsqueeze(-1).unsqueeze(-1) * eye  # (B, N, 2, 2)
-    return (RtR - target).pow(2).sum(dim=(-2, -1)).mean()
-
-
-def shape_residual_loss(residual: Tensor) -> Tensor:
-    """L2 penalty on shape prior residual — penalizes deviation from PCA subspace.
-
-    Applied to all samples (labeled + unlabeled). The residual δ measures
-    how much the prediction deviates from the learned anatomical shape space;
-    large δ indicates structurally implausible landmark configurations.
-
-    Args:
-        residual: (B, N_inst, K, 2) per-landmark offsets in logit space.
-
-    Returns:
-        Scalar: mean(δ²).
-    """
-    return residual.pow(2).mean()
-
-
-def instance_repulsion_loss(
-    task_outputs: dict[str, object],
-    matched_queries: dict[str, list[list[int]]] | None = None,
-) -> Tensor:
-    """Pairwise bbox IoU penalty — keeps unmatched queries off the matched one.
-
-    Most images have fewer GT instances than N_inst prediction slots. Unmatched
-    queries receive no spatial gradient and can drift toward the matched query's
-    location; this penalty pushes them away.
-
-    The penalty is symmetric, so applying it to every pair also drags the
-    MATCHED query away from its (correct) position — a force with no
-    justification on the single-GT images that make up most of the data. Passing
-    `matched_queries` detaches the matched slots: they still repel others, but
-    receive no gradient themselves. R17 ran without this and regressed hardest
-    on exactly the few-landmark tasks (PSAX +8.67, FUGC +5.24, IVC +4.90 vs R15).
-
-    Note the premise is weakly supported: measured instance separation on
-    val_local is already large (FA 167px, PLAX 156px, HC 94px centroid spacing),
-    i.e. collapse does not visibly occur. Default lambda_repulsion is 0.
-
-    Vectorized: stacks all tasks into (T, B, N, 4), computes the full
-    (T, B, N, N) IoU matrix, and averages the upper-triangle pairs.
-
-    Args:
-        task_outputs: {task_id: TaskOutput} with .bbox of shape (B, N, 4) cxcywh.
-        matched_queries: {task_id: per-image matched query indices}. When given,
-            matched slots contribute to the penalty but are detached from it.
-    """
-    task_ids = [tid for tid, t in task_outputs.items() if t.bbox.shape[1] >= 2]  # type: ignore[union-attr]
-    if not task_ids:
-        sample_bbox = next(iter(task_outputs.values())).bbox  # type: ignore[union-attr]
-        return sample_bbox.new_tensor(0.0)
-
-    bboxes = []
-    for tid in task_ids:
-        b = task_outputs[tid].bbox  # type: ignore[union-attr]
-        if matched_queries is not None and tid in matched_queries:
-            keep_grad = torch.ones_like(b[..., :1])
-            for img_idx, q_idx in enumerate(matched_queries[tid]):
-                for q in q_idx:
-                    keep_grad[img_idx, q] = 0.0
-            # Straight-through detach of the matched slots only.
-            b = b * keep_grad + b.detach() * (1.0 - keep_grad)
-        bboxes.append(b)
-
-    box = torch.stack(bboxes)  # (T, B, N, 4) cxcywh
-    half_wh = box[..., 2:] / 2
-    mins = box[..., :2] - half_wh  # (T, B, N, 2)
-    maxs = box[..., :2] + half_wh
-
-    # Pairwise intersection: (T, B, N, 1, 2) vs (T, B, 1, N, 2)
-    inter_mins = torch.max(mins.unsqueeze(-2), mins.unsqueeze(-3))
-    inter_maxs = torch.min(maxs.unsqueeze(-2), maxs.unsqueeze(-3))
-    inter_area = (inter_maxs - inter_mins).clamp(min=0).prod(dim=-1)  # (T, B, N, N)
-
-    area = box[..., 2] * box[..., 3]  # (T, B, N)
-    union = area.unsqueeze(-1) + area.unsqueeze(-2) - inter_area
-    iou = inter_area / union.clamp(min=1e-6)  # (T, B, N, N)
-
-    N = box.shape[2]
-    triu = torch.triu(torch.ones(N, N, device=iou.device), diagonal=1)
-    return (iou * triu).sum(dim=(-2, -1)).mean() / (N * (N - 1) // 2)
 
 
 # ---------------------------------------------------------------------------

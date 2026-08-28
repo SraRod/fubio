@@ -19,15 +19,7 @@ from torch import Tensor
 
 from fubio.data.shape_prior import TaskShapePrior
 from fubio.data.types import TaskOutput
-from fubio.models.coord_predictors import (
-    DirectPredictor,
-    GeoSimCCPredictor,
-    HeatmapPredictor,
-    RefPointsPredictor,
-    ShapePriorPredictor,
-    ShapeSimCCPredictor,
-    SimCCPredictor,
-)
+from fubio.models.coord_predictors import GeoSimCCPredictor
 from fubio.models.decoder import TaskRefinerLayer
 from fubio.models.queries import fourier_position_encoding
 
@@ -177,17 +169,8 @@ class TaskModule(nn.Module):
         task_shape_prior: TaskShapePrior | None = None,
         use_anchors: bool = False,
         derive_bbox: bool = False,
-        use_affine: bool = False,
         bbox_context_scale: float = 1.0,
-        conf_mlp_layers: int = 1,
-        coord_predictor: DirectPredictor
-        | RefPointsPredictor
-        | ShapePriorPredictor
-        | HeatmapPredictor
-        | SimCCPredictor
-        | ShapeSimCCPredictor
-        | None = None,
-        scored_mask: tuple[bool, ...] | None = None,
+        coord_predictor: GeoSimCCPredictor | None = None,
     ) -> None:
         super().__init__()
         self.n_inst = n_inst
@@ -195,7 +178,6 @@ class TaskModule(nn.Module):
         self._d_model = d_model
         self._use_anchors = use_anchors
         self.derive_bbox = derive_bbox
-        self.use_affine = use_affine
         self._bbox_context_scale = bbox_context_scale
 
         # --- Query parameters (from TaskQueryBank) ---
@@ -231,32 +213,11 @@ class TaskModule(nn.Module):
                 nn.GELU(),
                 nn.Linear(d_model, 4),
             )
-        if conf_mlp_layers >= 2:
-            self.conf_head = nn.Sequential(
-                nn.Linear(d_model, d_model),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(d_model, 1),
-            )
-        else:
-            self.conf_head = nn.Linear(d_model, 1)
+        self.conf_head = nn.Linear(d_model, 1)
 
-        if use_affine:
-            self.affine_fc = nn.Linear(d_model, 6)
-            nn.init.zeros_(self.affine_fc.weight)
-            self.affine_fc.bias.data.copy_(torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]))
-
-        self.coord_predictor = coord_predictor or DirectPredictor(d_model, n_keypoints)
-
-        # Evidence + scored_mask only when supportive landmarks are enabled
-        if scored_mask is not None:
-            self.evidence_head = nn.Linear(d_model, 1)
-            self.register_buffer(
-                "scored_mask",
-                torch.tensor(scored_mask, dtype=torch.bool),
-            )
-        else:
-            self.evidence_head = None
+        if coord_predictor is None:
+            raise ValueError("TaskModule requires a coord_predictor (GeoSimCCPredictor)")
+        self.coord_predictor = coord_predictor
 
     def query_params(self) -> list[nn.Parameter]:
         """Parameters that should be trained at lr_decoder (not lr_heads)."""
@@ -302,12 +263,8 @@ class TaskModule(nn.Module):
                     nn.init.zeros_(m.bias)
 
         # Confidence head
-        for m in (self.conf_head if isinstance(self.conf_head, nn.Sequential)
-                  else [self.conf_head]):
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+        nn.init.xavier_uniform_(self.conf_head.weight)
+        nn.init.zeros_(self.conf_head.bias)
 
         # Bbox MLP
         if hasattr(self, "bbox_mlp"):
@@ -316,18 +273,6 @@ class TaskModule(nn.Module):
                     nn.init.xavier_uniform_(m.weight)
                     if m.bias is not None:
                         nn.init.zeros_(m.bias)
-
-        # Affine head
-        if self.use_affine:
-            nn.init.zeros_(self.affine_fc.weight)
-            self.affine_fc.bias.data.copy_(
-                torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0])
-            )
-
-        # Evidence head
-        if self.evidence_head is not None:
-            nn.init.xavier_uniform_(self.evidence_head.weight)
-            nn.init.zeros_(self.evidence_head.bias)
 
         # Coord predictor: reinit learned params, keep buffers
         cp = self.coord_predictor
@@ -387,65 +332,29 @@ class TaskModule(nn.Module):
         inst_feat = self.feat_dropout(x[:, :, 0, :])  # (B, N_inst, D)
         lm_feat = self.feat_dropout(x[:, :, 1:, :])  # (B, N_inst, K, D)
 
-        affine_T = None
-        if self.use_affine:
-            affine_T = self.affine_fc(inst_feat).view(B, self.n_inst, 2, 3)
-
         conf = self.conf_head(inst_feat)
-        _kw = {}
-        if isinstance(self.coord_predictor, GeoSimCCPredictor):
-            # Only GeoSimCC consumes the shared keys / high-res map; passing them
-            # unconditionally would break every other predictor's signature.
-            _kw = {"mem_k": mem_k, "fine": fine}
         coords, extra = self.coord_predictor(
             inst_feat,
             lm_feat,
             memory,
             spatial_shape,
             memory_pos=memory_pos,
-            affine_T=affine_T,
-            **_kw,
+            mem_k=mem_k,
+            fine=fine,
         )
 
         # GeoSimCC returns its stage-1 heat here on purpose: routing it to
         # TaskOutput.heatmap is what makes lambda_heatmap supervise the
         # geometric locator directly, with no prior mixed into the sum.
-        heatmap = (
-            extra
-            if isinstance(self.coord_predictor, (HeatmapPredictor, GeoSimCCPredictor))
-            else None
-        )
-        simcc_logits = (
-            extra
-            if isinstance(self.coord_predictor, (SimCCPredictor, ShapeSimCCPredictor))
-            else None
-        )
-        residual = (
-            extra
-            if not isinstance(
-                self.coord_predictor,
-                (HeatmapPredictor, GeoSimCCPredictor, SimCCPredictor, ShapeSimCCPredictor),
-            )
-            else None
-        )
-
         bbox = (
             _derive_bbox(coords, context_scale=self._bbox_context_scale)
             if self.derive_bbox
             else self.bbox_mlp(inst_feat).sigmoid()
         )
 
-        evidence_logits = (
-            self.evidence_head(lm_feat).squeeze(-1) if self.evidence_head is not None else None
-        )
-
         return TaskOutput(
             bbox=bbox,
             conf=conf,
             landmarks=coords,
-            residual=residual,
-            heatmap=heatmap,
-            affine_T=affine_T,
-            simcc_logits=simcc_logits,
-            evidence=evidence_logits,
+            heatmap=extra,
         )

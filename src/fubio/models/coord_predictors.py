@@ -1,20 +1,11 @@
-"""Coordinate prediction modules — one per TaskModule mode.
+"""GeoSimCC coordinate readout (paper Section 2.4) and its geometry helpers.
 
-Unified interface: forward(inst_feat, lm_feat, memory, spatial_shape, affine_T) → (coords, extra).
-memory / spatial_shape are required only by HeatmapPredictor; the others ignore them.
-affine_T usage varies by mode:
-  - HeatmapPredictor: orients the data prior (pre-softmax logit bias)
-  - SimCCPredictor: post-hoc transform on soft-argmax coords (canonical → image space)
-  - Others: ignored
+Interface: forward(inst_feat, lm_feat, memory, spatial_shape, memory_pos,
+mem_k, fine) → (coords, heat). Six earlier readout modes (direct, ref_points,
+shape_prior, heatmap, simcc, shape_simcc) were retired with their configs;
+GeoSimCC is the readout of the submitted model.
 
-- DirectPredictor:      coords = sigmoid(coord_mlp(lm_feat))
-- RefPointsPredictor:   coords = sigmoid(coord_mlp(lm_feat) + ref_points)
-- ShapePriorPredictor:  coords = sigmoid(mean + α@basis + coord_mlp(lm_feat))
-- HeatmapPredictor:     coords = soft-argmax(softmax(q(lm_feat)·k(memory) / τ))  ← no sigmoid
-- SimCCPredictor:       coords = soft-argmax(softmax(x_head(lm_feat)))
-- ShapeSimCCPredictor:  coords = soft-argmax(softmax(x_head(lm_feat) + shape_gaussian_bias))
-
-Upstream: train/config.py (CoordConfig variants), data/shape_prior.py (TaskShapePrior).
+Upstream: train/config.py (GeoSimCCCoordConfig), data/shape_prior.py (TaskShapePrior).
 Downstream: heads.py (TaskModule owns a coord_predictor).
 """
 
@@ -27,24 +18,7 @@ from torch import Tensor
 
 from fubio.data.shape_prior import TaskShapePrior
 from fubio.data.task_registry import PARAMS
-from fubio.train.config import (
-    CoordConfig,
-    DirectCoordConfig,
-    GeoSimCCCoordConfig,
-    HeatmapCoordConfig,
-    RefPointsCoordConfig,
-    ShapePriorCoordConfig,
-    ShapeSimCCCoordConfig,
-    SimCCCoordConfig,
-)
-
-
-def _make_coord_mlp(d_model: int, dropout: float = 0.0) -> nn.Sequential:
-    layers: list[nn.Module] = [nn.Linear(d_model, d_model), nn.GELU()]
-    if dropout > 0:
-        layers.append(nn.Dropout(dropout))
-    layers.append(nn.Linear(d_model, 2))
-    return nn.Sequential(*layers)
+from fubio.train.config import GeoSimCCCoordConfig
 
 
 def measurement_partners(task_id: str, n_keypoints: int) -> list[int]:
@@ -147,400 +121,6 @@ def normalized_grid(hp: int, wp: int, device: torch.device) -> tuple[Tensor, Ten
     xs = ((gx + 0.5) / wp).flatten()
     ys = ((gy + 0.5) / hp).flatten()
     return xs, ys
-
-
-class DirectPredictor(nn.Module):
-    """coords = sigmoid(coord_mlp(lm_feat))."""
-
-    def __init__(self, d_model: int, n_keypoints: int) -> None:
-        super().__init__()
-        self._K = n_keypoints
-        self.coord_mlp = _make_coord_mlp(d_model)
-
-    def forward(
-        self,
-        inst_feat: Tensor,
-        lm_feat: Tensor,
-        memory: Tensor | None = None,
-        spatial_shape: tuple[int, int] | None = None,
-        memory_pos: Tensor | None = None,
-        affine_T: Tensor | None = None,
-    ) -> tuple[Tensor, None]:
-        coords = self.coord_mlp(lm_feat).sigmoid()
-        return coords, None
-
-
-class RefPointsPredictor(nn.Module):
-    """coords = sigmoid(coord_mlp(lm_feat) + ref_points)."""
-
-    def __init__(self, d_model: int, n_keypoints: int) -> None:
-        super().__init__()
-        self._K = n_keypoints
-        self.coord_mlp = _make_coord_mlp(d_model)
-        self.ref_points = nn.Parameter(torch.zeros(n_keypoints, 2))
-
-    def forward(
-        self,
-        inst_feat: Tensor,
-        lm_feat: Tensor,
-        memory: Tensor | None = None,
-        spatial_shape: tuple[int, int] | None = None,
-        memory_pos: Tensor | None = None,
-        affine_T: Tensor | None = None,
-    ) -> tuple[Tensor, None]:
-        raw = self.coord_mlp(lm_feat) + self.ref_points
-        coords = raw.sigmoid()
-        return coords, None
-
-
-class ShapePriorPredictor(nn.Module):
-    """coords = sigmoid(mean_shape + α@basis + residual_mlp(lm_feat)).
-
-    Instance query drives global shape coefficients (α, M DoF).
-    Landmark queries drive per-point residual corrections (δ, 2 DoF each).
-    """
-
-    def __init__(
-        self,
-        d_model: int,
-        n_keypoints: int,
-        prior: TaskShapePrior,
-        learnable_basis: bool = False,
-        dropout: float = 0.0,
-    ) -> None:
-        super().__init__()
-        self._K = n_keypoints
-        M = prior.M
-
-        # PCA mean and basis — logit space
-        mean_t = torch.tensor(prior.mean_logit, dtype=torch.float32).flatten()
-        basis_t = torch.tensor(prior.basis, dtype=torch.float32)
-
-        if learnable_basis:
-            self.mean_shape_logit = nn.Parameter(mean_t)
-            self.shape_basis = nn.Parameter(basis_t)
-        else:
-            self.register_buffer("mean_shape_logit", mean_t)
-            self.register_buffer("shape_basis", basis_t)
-
-        # Bias zero so the population-average initial alpha ≈ 0 → output
-        # centered near mean shape. Weight stays Kaiming default (std≈0.088)
-        # so different query embeddings produce different per-slot alphas —
-        # this symmetry breaking is essential; zero or near-zero weights lock
-        # all slots to identical outputs and gradients permanently.
-        self.coeff_head = nn.Linear(d_model, M)
-        nn.init.zeros_(self.coeff_head.bias)
-
-        self.coord_mlp = _make_coord_mlp(d_model, dropout=dropout)
-
-    def forward(
-        self,
-        inst_feat: Tensor,
-        lm_feat: Tensor,
-        memory: Tensor | None = None,
-        spatial_shape: tuple[int, int] | None = None,
-        memory_pos: Tensor | None = None,
-        affine_T: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor]:
-        B, N, _D = inst_feat.shape
-
-        # Global shape from instance features
-        alpha = self.coeff_head(inst_feat)  # (B, N, M)
-        structured = self.mean_shape_logit + alpha @ self.shape_basis  # (B, N, 2K)
-        structured = structured.view(B, N, self._K, 2)
-
-        # Per-landmark residual
-        residual = self.coord_mlp(lm_feat)  # (B, N, K, 2)
-
-        coords = (structured + residual).sigmoid()
-        return coords, residual
-
-
-class HeatmapPredictor(nn.Module):
-    """coords = soft-argmax( softmax( q(lm_feat) · k(memory) / τ ) ). No sigmoid.
-
-    Each landmark query scores every spatial memory token, forming a
-    distribution over the patch grid; the coordinate is that distribution's
-    centroid. Position is READ from grid geometry, not recalled by an MLP from
-    a pooled content vector — that is the whole point (fixes the indirect,
-    possibly non-injective content→coord regression).
-
-    These three are ONE unit, not options:
-      1. affinity heatmap — the explicit, inspectable "where" (heat is returned
-         so it can be visualized and supervised).
-      2. Gaussian supervision (loss.lambda_heatmap, applied in module) — forces
-         the distribution single-peaked. soft-argmax is a global centroid, so a
-         bimodal heat averages the two peaks into an anatomically impossible
-         midpoint; Gaussian supervision is the prerequisite that prevents this,
-         not an optional extra.
-      3. soft-argmax — centroid over grid coords. A convex combination of
-         in-range grid points is always in [0,1], so range holds WITHOUT a
-         sigmoid and edge landmarks stay reachable with healthy gradients.
-
-    Keys in : lm_feat (B,N,K,D), memory (B,S,D), spatial_shape (Hp,Wp), S=Hp*Wp.
-    Keys out: coords (B,N,K,2) in [0,1], heatmap (B,N,K,S).
-    """
-
-    def __init__(
-        self,
-        d_model: int,
-        n_keypoints: int,
-        tau: float = 1.0,
-        micro_residual: bool = False,
-        micro_cells: float = 1.0,
-        prior_mean: list[list[float]] | None = None,
-        prior_std: list[list[float]] | None = None,
-        prior_dropout: float = 0.0,
-        use_memory_pos: bool = False,
-    ) -> None:
-        super().__init__()
-        self._K = n_keypoints
-        self.q_proj = nn.Linear(d_model, d_model)
-        self.k_proj = nn.Linear(d_model, d_model)
-        self._scale = tau * d_model**0.5
-        # Micro residual (P5 微觀): bounded texture-driven correction on top of
-        # the heatmap's grid-level position. tanh × (micro_cells/grid) keeps it
-        # strictly sub-grid so it refines, never overrides, the macro localization.
-        self._micro_cells = micro_cells
-        self.residual_mlp = _make_coord_mlp(d_model) if micro_residual else None
-
-        # Data positional prior (breaks cold-start symmetry / collapse): a
-        # per-landmark log-Gaussian added to the affinity logits, so the softmax
-        # is a Bayesian posterior — likelihood (q·memory) × prior (data μ_k,σ_k).
-        # When q·memory is still flat, heat peaks at each landmark's data mean →
-        # K distinct predictions instead of all collapsing to the grid centroid.
-        self._data_prior = prior_mean is not None
-        self._prior_dropout = prior_dropout
-        self._use_memory_pos = use_memory_pos
-        if self._data_prior:
-            self.register_buffer("prior_mean", torch.tensor(prior_mean, dtype=torch.float32))
-            self.register_buffer("prior_std", torch.tensor(prior_std, dtype=torch.float32))
-
-    def forward(
-        self,
-        inst_feat: Tensor,
-        lm_feat: Tensor,
-        memory: Tensor | None = None,
-        spatial_shape: tuple[int, int] | None = None,
-        memory_pos: Tensor | None = None,
-        affine_T: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor]:
-        if memory is None or spatial_shape is None:
-            raise ValueError("HeatmapPredictor requires memory and spatial_shape")
-        hp, wp = spatial_shape
-
-        q = self.q_proj(lm_feat)  # (B, N, K, D)
-        # Positional encoding in keys — CNN features are translation-equivariant
-        # so position must be injected explicitly; for ViT it's redundant but harmless
-        use_pos = self._use_memory_pos and memory_pos is not None
-        mem = memory + memory_pos if use_pos else memory
-        k = self.k_proj(mem)  # (B, S, D)
-
-        logits = torch.einsum("bnkd,bsd->bnks", q, k) / self._scale  # (B, N, K, S)
-
-        xs, ys = normalized_grid(hp, wp, memory.device)  # each (S,)
-
-        if self._data_prior:
-            if affine_T is not None:
-                # Oriented prior: T @ [canonical_μ, 1]ᵀ → per-instance adapted μ
-                # prior_mean: (K, 2), affine_T: (B, N, 2, 3)
-                K = self.prior_mean.shape[0]
-                ones = torch.ones(K, 1, device=self.prior_mean.device)
-                mu_h = torch.cat([self.prior_mean, ones], dim=-1)  # (K, 3)
-                oriented_mu = torch.einsum("bnij,kj->bnki", affine_T, mu_h)
-                std = self.prior_std[None, None, :, :]  # (1, 1, K, 2)
-                dx = (xs[None, None, None, :] - oriented_mu[..., 0:1]) / std[..., 0:1]
-                dy = (ys[None, None, None, :] - oriented_mu[..., 1:2]) / std[..., 1:2]
-                # Clamp before squaring: bf16 max ~65504, 200²=40000 stays in range
-                dx = dx.clamp(-200, 200)
-                dy = dy.clamp(-200, 200)
-                prior_logits = -0.5 * (dx**2 + dy**2)
-            else:
-                # Static prior fallback (backward compat, no AffineHead)
-                dx = (xs[None, :] - self.prior_mean[:, 0:1]) / self.prior_std[:, 0:1]  # (K, S)
-                dy = (ys[None, :] - self.prior_mean[:, 1:2]) / self.prior_std[:, 1:2]
-                prior_logits = -0.5 * (dx**2 + dy**2)
-
-            # KNOWN HARMFUL — keep at 0.0. Measured 2026-07-26: 3 of 4 runs at
-            # p=0.1 collapsed the n_inst slots to bit-identical outputs (archived
-            # under logs/r20-collapsed-*.csv), against 5 of 5 healthy at p=0.0.
-            #
-            # Mechanism: a dropped instance's heatmap goes near-uniform, because
-            # the visual branch alone is ~8x worse (disabling the prior at
-            # inference on R15 takes val_local MRE 31.90 -> 255.23). That yields
-            # very large, noisy localization gradients on a matched slot; Hungarian
-            # matching then makes slot identity discontinuous, and permutation-
-            # equivalent slots converge onto one solution.
-            #
-            # Do NOT "fix" this with inverted dropout's 1/(1-p) rescaling:
-            # prior_logits are added pre-softmax, so scaling them changes the
-            # distribution's sharpness, not a mean. Note also that w * prior_logits
-            # is exactly equivalent to widening sigma by 1/sqrt(w) — attenuation
-            # and blurring are the same operation here.
-            #
-            # To actually reduce prior dependence, supervise the visual branch
-            # directly with an auxiliary prior-free heatmap loss and keep the full
-            # prior in the served output. That is a separate experiment, not a
-            # baseline setting.
-            if self.training and self._prior_dropout > 0.0:
-                B, N = logits.shape[:2]
-                keep = torch.rand(B, N, 1, 1, device=logits.device) >= self._prior_dropout
-                prior_logits = prior_logits * keep
-
-            logits = logits + prior_logits
-
-        heat = logits.softmax(dim=-1)  # (B, N, K, S)
-        coord_x = (heat * xs).sum(dim=-1)  # (B, N, K)
-        coord_y = (heat * ys).sum(dim=-1)
-        coords = torch.stack([coord_x, coord_y], dim=-1)  # (B, N, K, 2)
-
-        if self.residual_mlp is not None:
-            delta = torch.tanh(self.residual_mlp(lm_feat))  # (B, N, K, 2) in [-1,1]
-            bound = delta.new_tensor([self._micro_cells / wp, self._micro_cells / hp])
-            coords = (coords + delta * bound).clamp(0.0, 1.0)
-
-        return coords, heat
-
-
-class SimCCPredictor(nn.Module):
-    """[P2: SimCC readout] 1D coordinate classification with soft-argmax.
-
-    RTMPose pattern: separate x/y into independent 1D bin distributions.
-    Each landmark query produces two 1D logit vectors (x and y), softmax
-    gives a probability distribution over bins, and soft-argmax (integral)
-    yields sub-bin precision.
-
-    n_bins = input_size × split_ratio. Higher split_ratio = finer resolution.
-    Gaussian soft-label CE supervises the distribution (see losses.simcc_loss).
-
-    Keys in : lm_feat (B, N, K, D).
-    Keys out: coords (B, N, K, 2) in [0,1], simcc_logits (x_logits, y_logits).
-    """
-
-    def __init__(self, d_model: int, n_keypoints: int, n_bins: int) -> None:
-        super().__init__()
-        self._K = n_keypoints
-        self._n_bins = n_bins
-        self.x_head = nn.Linear(d_model, n_bins)
-        self.y_head = nn.Linear(d_model, n_bins)
-
-    def forward(
-        self,
-        inst_feat: Tensor,
-        lm_feat: Tensor,
-        memory: Tensor | None = None,
-        spatial_shape: tuple[int, int] | None = None,
-        memory_pos: Tensor | None = None,
-        affine_T: Tensor | None = None,
-    ) -> tuple[Tensor, tuple[Tensor, Tensor]]:
-        x_logits = self.x_head(lm_feat)  # (B, N, K, n_bins)
-        y_logits = self.y_head(lm_feat)  # (B, N, K, n_bins)
-
-        # Soft-argmax with pixel-center convention: bin i centered at (i+0.5)/n_bins.
-        # fp32 bins to avoid bf16 integer quantization at large n_bins.
-        bins = torch.arange(self._n_bins, device=lm_feat.device, dtype=torch.float32) + 0.5
-        prob_x = x_logits.float().softmax(dim=-1)
-        prob_y = y_logits.float().softmax(dim=-1)
-        coord_x = (prob_x * bins).sum(dim=-1) / self._n_bins
-        coord_y = (prob_y * bins).sum(dim=-1) / self._n_bins
-        coords = torch.stack([coord_x, coord_y], dim=-1).to(lm_feat.dtype)  # (B, N, K, 2)
-
-        if affine_T is not None:
-            ones = torch.ones(*coords.shape[:-1], 1, device=coords.device, dtype=coords.dtype)
-            coords_h = torch.cat([coords, ones], dim=-1)  # (B, N, K, 3)
-            coords = torch.einsum("bnij,bnkj->bnki", affine_T, coords_h)
-            coords = coords.clamp(0.0, 1.0)
-
-        return coords, (x_logits, y_logits)
-
-
-class ShapeSimCCPredictor(nn.Module):
-    """PCA shape model biases SimCC 1D bin classification.
-
-    Composes ShapePriorPredictor (mean + α@basis + residual → coarse_xy)
-    with SimCC heads (1D bin logits per landmark). The coarse position
-    becomes a Gaussian prior on the bin logits — analogous to
-    HeatmapPredictor's data_prior but instance-adaptive (α predicted
-    from features, not a static population mean).
-
-    Keys in : inst_feat (B, N, D), lm_feat (B, N, K, D).
-    Keys out: coords (B, N, K, 2) in [0,1], simcc_logits (x_logits, y_logits).
-    """
-
-    def __init__(
-        self,
-        d_model: int,
-        n_keypoints: int,
-        n_bins: int,
-        prior: TaskShapePrior,
-        learnable_basis: bool = False,
-        dropout: float = 0.0,
-    ) -> None:
-        super().__init__()
-        self._K = n_keypoints
-        self._n_bins = n_bins
-
-        self.shape = ShapePriorPredictor(
-            d_model, n_keypoints, prior, learnable_basis=learnable_basis, dropout=dropout
-        )
-
-        self.x_head = nn.Linear(d_model, n_bins)
-        self.y_head = nn.Linear(d_model, n_bins)
-
-        # Gaussian spread in [0,1] space via bounded sigmoid parameterization.
-        # Effective log_sigma ∈ [LOG_SIGMA_MIN, LOG_SIGMA_MAX]:
-        #   min: exp(-6) ≈ 0.0025 → ~2.5 bins spread (sharp but not collapsed)
-        #   max: exp(-0.5) ≈ 0.6 → diffuse prior
-        # Sigmoid keeps gradients non-zero at both bounds (unlike clamp).
-        # Raw value 0.0 → sigmoid=0.5 → effective log_sigma = -3.25 ≈ initial.
-        self._LOG_SIGMA_MIN = -6.0
-        self._LOG_SIGMA_MAX = -0.5
-        self._log_sigma_raw = nn.Parameter(torch.tensor(0.0))
-
-    def forward(
-        self,
-        inst_feat: Tensor,
-        lm_feat: Tensor,
-        memory: Tensor | None = None,
-        spatial_shape: tuple[int, int] | None = None,
-        memory_pos: Tensor | None = None,
-        affine_T: Tensor | None = None,
-    ) -> tuple[Tensor, tuple[Tensor, Tensor]]:
-        # Shape model → instance-adaptive coarse position
-        coarse_xy, _ = self.shape(inst_feat, lm_feat)  # (B, N, K, 2) in [0,1]
-
-        # SimCC bin logits from landmark features
-        x_logits = self.x_head(lm_feat)  # (B, N, K, n_bins)
-        y_logits = self.y_head(lm_feat)
-
-        # Gaussian bias centered at coarse position (prior × likelihood).
-        # Pixel-center convention: bin i at (i+0.5)/n_bins. fp32 for bf16 safety.
-        bin_pos = (
-            torch.arange(self._n_bins, device=lm_feat.device, dtype=torch.float32) + 0.5
-        ) / self._n_bins  # (n_bins,) in (0, 1)
-        t = torch.sigmoid(self._log_sigma_raw)
-        log_sigma = self._LOG_SIGMA_MIN + t * (self._LOG_SIGMA_MAX - self._LOG_SIGMA_MIN)
-        sigma = log_sigma.exp()
-        dx = (bin_pos - coarse_xy[..., 0:1].float()) / sigma  # (B, N, K, n_bins)
-        dy = (bin_pos - coarse_xy[..., 1:2].float()) / sigma
-        dx = dx.clamp(-200, 200)
-        dy = dy.clamp(-200, 200)
-        x_logits = x_logits.float() + (-0.5 * dx**2)
-        y_logits = y_logits.float() + (-0.5 * dy**2)
-
-        # Soft-argmax with pixel-center bins → [0, 1]
-        bins = torch.arange(self._n_bins, device=lm_feat.device, dtype=torch.float32) + 0.5
-        coord_x = (x_logits.softmax(dim=-1) * bins).sum(dim=-1) / self._n_bins
-        coord_y = (y_logits.softmax(dim=-1) * bins).sum(dim=-1) / self._n_bins
-        coords = torch.stack([coord_x, coord_y], dim=-1).to(lm_feat.dtype)  # (B, N, K, 2)
-
-        if affine_T is not None:
-            ones = torch.ones(*coords.shape[:-1], 1, device=coords.device, dtype=coords.dtype)
-            coords_h = torch.cat([coords, ones], dim=-1)  # (B, N, K, 3)
-            coords = torch.einsum("bnij,bnkj->bnki", affine_T, coords_h)
-            coords = coords.clamp(0.0, 1.0)
-
-        return coords, (x_logits, y_logits)
 
 
 class GeoSimCCPredictor(nn.Module):
@@ -695,7 +275,6 @@ class GeoSimCCPredictor(nn.Module):
         memory: Tensor | None = None,
         spatial_shape: tuple[int, int] | None = None,
         memory_pos: Tensor | None = None,
-        affine_T: Tensor | None = None,
         mem_k: Tensor | None = None,
         fine: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
@@ -757,108 +336,32 @@ class GeoSimCCPredictor(nn.Module):
 
 
 def build_coord_predictor(
-    config: CoordConfig,
+    config: GeoSimCCCoordConfig,
     d_model: int,
     n_keypoints: int,
     task_shape_prior: TaskShapePrior | None = None,
-    input_size: int | None = None,
     dropout: float = 0.0,
     task_id: str | None = None,
     d_fine: int | None = None,
     own_keys: bool = True,
-) -> (
-    DirectPredictor
-    | RefPointsPredictor
-    | ShapePriorPredictor
-    | HeatmapPredictor
-    | SimCCPredictor
-    | ShapeSimCCPredictor
-    | GeoSimCCPredictor
-):
-    """Factory: create the right CoordPredictor from config."""
-    if isinstance(config, DirectCoordConfig):
-        return DirectPredictor(d_model, n_keypoints)
-
-    if isinstance(config, RefPointsCoordConfig):
-        return RefPointsPredictor(d_model, n_keypoints)
-
-    if isinstance(config, HeatmapCoordConfig):
-        prior_mean = prior_std = None
-        if config.data_prior:
-            if task_shape_prior is None or task_shape_prior.mean_xy is None:
-                raise ValueError(
-                    "HeatmapCoordConfig.data_prior requires a shape prior with mean_xy/std_xy — "
-                    "rebuild shape_prior.json with the current build_shape_prior."
-                )
-            prior_mean = task_shape_prior.mean_xy
-            prior_std = task_shape_prior.std_xy
-        return HeatmapPredictor(
-            d_model,
-            n_keypoints,
-            tau=config.tau,
-            micro_residual=config.micro_residual,
-            micro_cells=config.micro_cells,
-            prior_mean=prior_mean,
-            prior_std=prior_std,
-            prior_dropout=config.prior_dropout,
-            use_memory_pos=config.use_memory_pos,
+) -> GeoSimCCPredictor:
+    """Factory: create the coord predictor from config."""
+    if task_shape_prior is None:
+        raise ValueError(
+            "GeoSimCCCoordConfig requires task_shape_prior — was shape_prior.json loaded?"
         )
-
-    if isinstance(config, ShapePriorCoordConfig):
-        if task_shape_prior is None:
-            raise ValueError(
-                "ShapePriorCoordConfig requires task_shape_prior — was the shape_prior.json loaded?"
-            )
-        return ShapePriorPredictor(
-            d_model=d_model,
-            n_keypoints=n_keypoints,
-            prior=task_shape_prior,
-            learnable_basis=config.learnable_basis,
-            dropout=dropout,
-        )
-
-    if isinstance(config, SimCCCoordConfig):
-        if input_size is None:
-            raise ValueError("SimCCCoordConfig requires input_size to compute n_bins")
-        n_bins = int(input_size * config.split_ratio)
-        return SimCCPredictor(d_model=d_model, n_keypoints=n_keypoints, n_bins=n_bins)
-
-    if isinstance(config, ShapeSimCCCoordConfig):
-        if task_shape_prior is None:
-            raise ValueError(
-                "ShapeSimCCCoordConfig requires task_shape_prior — was shape_prior.json loaded?"
-            )
-        if input_size is None:
-            raise ValueError("ShapeSimCCCoordConfig requires input_size to compute n_bins")
-        n_bins = int(input_size * config.split_ratio)
-        return ShapeSimCCPredictor(
-            d_model=d_model,
-            n_keypoints=n_keypoints,
-            n_bins=n_bins,
-            prior=task_shape_prior,
-            learnable_basis=config.learnable_basis,
-            dropout=dropout,
-        )
-
-    if isinstance(config, GeoSimCCCoordConfig):
-        if task_shape_prior is None:
-            raise ValueError(
-                "GeoSimCCCoordConfig requires task_shape_prior — was shape_prior.json loaded?"
-            )
-        return GeoSimCCPredictor(
-            d_model=d_model,
-            n_keypoints=n_keypoints,
-            prior=task_shape_prior,
-            tau=config.tau,
-            window_cells=config.window_cells,
-            n_offset_bins=config.n_offset_bins,
-            n_profile=config.n_profile,
-            shape_weight=config.shape_weight,
-            d_local=config.d_local,
-            dropout=dropout,
-            partner=measurement_partners(task_id, n_keypoints) if task_id else None,
-            d_fine=d_fine,
-            own_keys=own_keys,
-        )
-
-    raise TypeError(f"Unknown coord config type: {type(config)}")
+    return GeoSimCCPredictor(
+        d_model=d_model,
+        n_keypoints=n_keypoints,
+        prior=task_shape_prior,
+        tau=config.tau,
+        window_cells=config.window_cells,
+        n_offset_bins=config.n_offset_bins,
+        n_profile=config.n_profile,
+        shape_weight=config.shape_weight,
+        d_local=config.d_local,
+        dropout=dropout,
+        partner=measurement_partners(task_id, n_keypoints) if task_id else None,
+        d_fine=d_fine,
+        own_keys=own_keys,
+    )

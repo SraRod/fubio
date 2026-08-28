@@ -62,15 +62,9 @@ class TaskOutput(NamedTuple):
     Each task produces N_inst instance slots. Unmatched slots are
     suppressed by low confidence during training (via Hungarian matching)
     and at inference (via thresholding).
-
-    K_total = K_scored + K_supportive (per-task).
     """
 
     bbox: Tensor  # (B, N_inst, 4) — cx, cy, w, h normalized [0,1]
     conf: Tensor  # (B, N_inst, 1) — raw logit (sigmoid → confidence)
-    landmarks: Tensor  # (B, N_inst, K_total, 2) — normalized [0,1]
-    residual: Tensor | None = None  # (B, N_inst, K_total, 2) — shape prior residual δ
-    heatmap: Tensor | None = None  # (B, N_inst, K_total, S) — affinity dist (heatmap mode)
-    affine_T: Tensor | None = None  # (B, N_inst, 2, 3) — predicted affine transform
-    simcc_logits: tuple[Tensor, Tensor] | None = None  # [P2] (x_logits, y_logits) for SimCC loss
-    evidence: Tensor | None = None  # (B, N_inst, K_total) — raw logits for evidence prediction
+    landmarks: Tensor  # (B, N_inst, K, 2) — normalized [0,1]
+    heatmap: Tensor | None = None  # (B, N_inst, K, S) — GeoSimCC stage-1 affinity dist

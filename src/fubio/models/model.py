@@ -35,14 +35,7 @@ from fubio.models.coord_predictors import build_coord_predictor
 from fubio.models.decoder import CrossAttentionDecoder
 from fubio.models.heads import TaskModule
 from fubio.models.neck import NeckOutput, build_neck
-from fubio.train.config import (
-    C2fNeckConfig,
-    CoordConfig,
-    DirectCoordConfig,
-    GeoSimCCCoordConfig,
-    MultiLayerNeckConfig,
-    NeckModeConfig,
-)
+from fubio.train.config import C2fNeckConfig, GeoSimCCCoordConfig, NeckModeConfig
 
 
 class ModelOutput(NamedTuple):
@@ -79,40 +72,27 @@ class FUBioModel(nn.Module):
         n_decoder_layers: int = 3,
         n_head_layers: int = 2,
         n_inst: int = 2,
-        use_uncertainty: bool = False,
         derive_bbox: bool = False,
-        use_affine: bool = False,
-        return_intermediate: bool = False,
-        coord_config: CoordConfig | None = None,
+        coord_config: GeoSimCCCoordConfig | None = None,
         shape_prior: ShapePrior | None = None,
         neck_config: NeckModeConfig | None = None,
         neck_dropout: float = 0.1,
         dropout: float = 0.1,
-        conf_mlp_layers: int = 1,
-        input_size: int = 518,
-        use_supportive: bool = False,
     ) -> None:
         super().__init__()
         self.n_inst = n_inst
-        _coord_config = coord_config or DirectCoordConfig()
+        _coord_config = coord_config or GeoSimCCCoordConfig()
 
         # Layer 1: Backbone → patch embeddings
-        _need_intermediate = return_intermediate
-        _layer_indices: list[int] | None = None
-        if isinstance(neck_config, (MultiLayerNeckConfig, C2fNeckConfig)):
-            _need_intermediate = True
-            _layer_indices = neck_config.layer_indices
+        if neck_config is None:
+            neck_config = C2fNeckConfig()
         self.backbone = build_backbone(
             name=backbone_name,
-            return_intermediate=_need_intermediate,
-            intermediate_layer_indices=_layer_indices,
+            return_intermediate=True,
+            intermediate_layer_indices=neck_config.layer_indices,
         )
 
         # Layer 2: Neck → shared spatial memory (blackboard for Layer 3 + 4)
-        if neck_config is None:
-            from fubio.train.config import LinearNeckConfig
-
-            neck_config = LinearNeckConfig()
         self.neck = build_neck(
             config=neck_config,
             backbone=self.backbone,
@@ -134,33 +114,29 @@ class FUBioModel(nn.Module):
         # work, so it lives with the decoder rather than being repeated inside
         # all nine TaskModules (which projected the same (B,S,D) nine times).
         # Task specificity stays in the per-task query, as everywhere else.
-        self._geo = isinstance(_coord_config, GeoSimCCCoordConfig)
-        if self._geo:
-            self.loc_k_proj = nn.Linear(d_model, d_model)
-            # High-resolution map for stage-3 profile sampling. Deliberately NOT
-            # part of `memory`: attention over it would cost O(S) at this
-            # resolution, but sampling costs only O(K * n_profile), so the fine
-            # detail is affordable exactly where it is needed. The stem reads the
-            # image directly — the backbone's patch embedding has already
-            # discarded sub-patch structure by the time memory exists.
-            _st = _coord_config.fine_stride
-            _df = _coord_config.d_fine
-            self.fine_stem = nn.Sequential(
-                nn.Conv2d(3, _df // 2, 3, stride=2, padding=1),
-                nn.GELU(),
-                nn.Conv2d(_df // 2, _df, 3, stride=_st // 2, padding=1),
-            )
-            self.fine_proj = nn.Conv2d(d_model, _df, 1)
-            self._fine_stride = _st
+        self.loc_k_proj = nn.Linear(d_model, d_model)
+        # High-resolution map for stage-3 profile sampling. Deliberately NOT
+        # part of `memory`: attention over it would cost O(S) at this
+        # resolution, but sampling costs only O(K * n_profile), so the fine
+        # detail is affordable exactly where it is needed. The stem reads the
+        # image directly — the backbone's patch embedding has already
+        # discarded sub-patch structure by the time memory exists.
+        _st = _coord_config.fine_stride
+        _df = _coord_config.d_fine
+        self.fine_stem = nn.Sequential(
+            nn.Conv2d(3, _df // 2, 3, stride=2, padding=1),
+            nn.GELU(),
+            nn.Conv2d(_df // 2, _df, 3, stride=_st // 2, padding=1),
+        )
+        self.fine_proj = nn.Conv2d(d_model, _df, 1)
+        self._fine_stride = _st
 
         # Layer 4: Per-task modules (queries + refiner + predictors)
-        # use_supportive=True → n_total (scored + supportive);
-        # False → n_keypoints (scored only, for loading pre-supportive checkpoints).
         _use_anchors = shape_prior is not None
         self.tasks = nn.ModuleDict(
             {
                 tid: TaskModule(
-                    n_keypoints=tdef.n_total if use_supportive else tdef.n_keypoints,
+                    n_keypoints=tdef.n_keypoints,
                     d_model=d_model,
                     n_inst=n_inst,
                     n_head_layers=n_head_layers,
@@ -170,25 +146,17 @@ class FUBioModel(nn.Module):
                     task_shape_prior=shape_prior.tasks.get(tid) if shape_prior else None,
                     use_anchors=_use_anchors,
                     derive_bbox=derive_bbox,
-                    use_affine=use_affine,
                     bbox_context_scale=tdef.bbox_context_scale,
-                    conf_mlp_layers=conf_mlp_layers,
                     coord_predictor=build_coord_predictor(
                         config=_coord_config,
                         d_model=d_model,
-                        n_keypoints=tdef.n_total if use_supportive else tdef.n_keypoints,
+                        n_keypoints=tdef.n_keypoints,
                         task_shape_prior=shape_prior.tasks.get(tid) if shape_prior else None,
-                        input_size=input_size,
                         dropout=dropout,
                         task_id=tid,
-                        d_fine=(
-                            _coord_config.d_fine
-                            if isinstance(_coord_config, GeoSimCCCoordConfig)
-                            else None
-                        ),
+                        d_fine=_coord_config.d_fine,
                         own_keys=False,
                     ),
-                    scored_mask=tdef.scored_mask if use_supportive else None,
                 )
                 for tid, tdef in TASKS.items()
             }
@@ -245,16 +213,14 @@ class FUBioModel(nn.Module):
         # Shared, built once: localisation keys and the high-resolution map that
         # stage 3 samples. Both are task-agnostic reads of the image/memory, so
         # computing them per task would be pure duplication.
-        _mem_k = _fine = None
-        if self._geo:
-            _mem_k = self.loc_k_proj(neck_out.memory + neck_out.memory_pos)
-            _hp, _wp = neck_out.spatial_shape
-            _m2d = neck_out.memory.transpose(1, 2).reshape(images.shape[0], -1, _hp, _wp)
-            _fine_stem_out = self.fine_stem(images)
-            _fh, _fw = _fine_stem_out.shape[-2], _fine_stem_out.shape[-1]
-            _fine = _fine_stem_out + F.interpolate(
-                self.fine_proj(_m2d), size=(_fh, _fw), mode="bilinear", align_corners=False
-            )
+        _mem_k = self.loc_k_proj(neck_out.memory + neck_out.memory_pos)
+        _hp, _wp = neck_out.spatial_shape
+        _m2d = neck_out.memory.transpose(1, 2).reshape(images.shape[0], -1, _hp, _wp)
+        _fine_stem_out = self.fine_stem(images)
+        _fh, _fw = _fine_stem_out.shape[-2], _fine_stem_out.shape[-1]
+        _fine = _fine_stem_out + F.interpolate(
+            self.fine_proj(_m2d), size=(_fh, _fw), mode="bilinear", align_corners=False
+        )
 
         # Layer 4: per-task refinement + prediction (reads memory for spatial grounding)
         results: dict[str, TaskOutput] = {}

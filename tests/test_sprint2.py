@@ -3,52 +3,24 @@
 from __future__ import annotations
 
 import torch
-import torch.nn as nn
-from torch import Tensor
 
+from conftest import C_BACKBONE, N_SPATIAL, D, make_task_module
 from fubio.data.task_registry import TASKS
 from fubio.data.types import TaskOutput
 from fubio.models.backbone import BackboneOutput
 from fubio.models.decoder import CrossAttentionDecoder, CrossAttentionLayer, TaskRefinerLayer
-from fubio.models.heads import TaskModule
-from fubio.models.neck import LinearNeck, sinusoidal_2d_pos_enc
+from fubio.models.neck import C2fNeck, sinusoidal_2d_pos_enc
 
 B = 2
-D = 256
-N_SPATIAL = 1369  # 37 * 37
-C_BACKBONE = 768
 
 
-# ---------------------------------------------------------------------------
-# Stub backbone for tests (no torch.hub download)
-# ---------------------------------------------------------------------------
-
-
-class _StubBackbone(nn.Module):
-    """Mimics DINOv2Backbone output shapes without loading real weights."""
-
-    def __init__(self, c_backbone: int = C_BACKBONE) -> None:
-        super().__init__()
-        self.embed_dim = c_backbone
-        self.patch_size = 14
-        self._linear = nn.Linear(3, c_backbone)
-
-    def freeze(self) -> None:
-        pass
-
-    def unfreeze(self) -> None:
-        pass
-
-    def param_groups(self, lr: float, layer_decay: float = 1.0) -> list[dict]:
-        return [{"params": list(self.parameters()), "lr": lr, "name": "backbone"}]
-
-    def forward(self, x: Tensor) -> BackboneOutput:
-        b = x.shape[0]
-        tokens = torch.randn(b, N_SPATIAL, self.embed_dim, device=x.device)
-        return BackboneOutput(
-            features=[tokens],
-            spatial_shape=(37, 37),
-        )
+def _head_inputs(batch: int = B) -> dict:
+    """Memory-side inputs TaskModule.head needs for the GeoSimCC readout."""
+    return {
+        "memory": torch.randn(batch, N_SPATIAL, D),
+        "spatial_shape": (37, 37),
+        "memory_pos": torch.zeros(1, N_SPATIAL, D),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -72,13 +44,13 @@ class TestSinusoidal2DPosEnc:
 
 
 # ---------------------------------------------------------------------------
-# Projection
+# Neck
 # ---------------------------------------------------------------------------
 
 
-class TestLinearNeck:
+class TestC2fNeck:
     def test_shapes(self) -> None:
-        neck = LinearNeck(C_BACKBONE, D)
+        neck = C2fNeck(n_layers=1, c_backbone=C_BACKBONE, d_model=D, n_bottleneck=1)
         backbone_out = BackboneOutput(
             features=[torch.randn(B, N_SPATIAL, C_BACKBONE)],
             spatial_shape=(37, 37),
@@ -97,28 +69,19 @@ class TestLinearNeck:
 class TestTaskModuleQueries:
     def test_shapes(self) -> None:
         K, n_inst = 4, 2
-        tm = TaskModule(n_keypoints=K, d_model=D, n_inst=n_inst)
+        tm = make_task_module(K, n_inst=n_inst)
         q, qp = tm.get_queries(batch_size=B)
         assert q.shape == (B, n_inst * (1 + K), D)
-        # Without anchors the positional term is zeros, not None — callers add it
-        # unconditionally and zeros are the no-op under addition.
+        # Anchors are initialized from the prior mean, so the positional term
+        # is a real encoding, not zeros.
         assert qp.shape == q.shape
-        assert torch.equal(qp, torch.zeros_like(qp))
 
     def test_n_queries(self) -> None:
         n_inst = 2
         for tid, tdef in TASKS.items():
-            tm = TaskModule(n_keypoints=tdef.n_keypoints, d_model=D, n_inst=n_inst)
+            tm = make_task_module(tdef.n_keypoints, n_inst=n_inst)
             expected = n_inst * (1 + tdef.n_keypoints)
             assert tm.n_queries == expected, f"{tid}: expected {expected}, got {tm.n_queries}"
-
-    def test_anchor_queries(self) -> None:
-        K, n_inst = 4, 2
-        tm = TaskModule(n_keypoints=K, d_model=D, n_inst=n_inst, use_anchors=True)
-        q, qp = tm.get_queries(batch_size=B)
-        assert q.shape == (B, n_inst * (1 + K), D)
-        assert qp is not None
-        assert qp.shape == (B, n_inst * (1 + K), D)
 
 
 # ---------------------------------------------------------------------------
@@ -197,80 +160,67 @@ class TestTaskModuleHead:
     def test_shapes(self) -> None:
         K = 4
         n_inst = 2
-        tm = TaskModule(n_keypoints=K, d_model=D, n_inst=n_inst, n_head_layers=1)
+        tm = make_task_module(K, n_inst=n_inst)
         x = torch.randn(B, n_inst * (1 + K), D)
-        out = tm.head(x)
+        out = tm.head(x, **_head_inputs())
         assert isinstance(out, TaskOutput)
         assert out.bbox.shape == (B, n_inst, 4)
         assert out.conf.shape == (B, n_inst, 1)
         assert out.landmarks.shape == (B, n_inst, K, 2)
 
     def test_bbox_in_range(self) -> None:
-        tm = TaskModule(n_keypoints=6, d_model=D, n_inst=2, n_head_layers=1)
+        tm = make_task_module(6, n_inst=2)
         x = torch.randn(B, 2 * (1 + 6), D)
-        out = tm.head(x)
+        out = tm.head(x, **_head_inputs())
         assert out.bbox.min() >= 0.0
         assert out.bbox.max() <= 1.0
 
     def test_landmarks_in_range(self) -> None:
-        tm = TaskModule(n_keypoints=6, d_model=D, n_inst=2, n_head_layers=1)
+        tm = make_task_module(6, n_inst=2)
         x = torch.randn(B, 2 * (1 + 6), D)
-        out = tm.head(x)
+        out = tm.head(x, **_head_inputs())
         assert out.landmarks.min() >= 0.0
         assert out.landmarks.max() <= 1.0
 
+    def test_stage1_heat_is_returned(self) -> None:
+        """GeoSimCC routes its stage-1 heat to TaskOutput.heatmap for lambda_heatmap."""
+        K, n_inst = 4, 2
+        tm = make_task_module(K, n_inst=n_inst)
+        x = torch.randn(B, n_inst * (1 + K), D)
+        out = tm.head(x, **_head_inputs())
+        assert out.heatmap is not None
+        assert out.heatmap.shape == (B, n_inst, K, N_SPATIAL)
+        # Softmax over the grid: each landmark's heat sums to 1
+        torch.testing.assert_close(
+            out.heatmap.sum(-1), torch.ones(B, n_inst, K), atol=1e-4, rtol=0
+        )
+
     def test_multi_head_layers(self) -> None:
-        tm = TaskModule(n_keypoints=4, d_model=D, n_inst=2, n_head_layers=3)
+        tm = make_task_module(4, n_inst=2, n_head_layers=3)
         x = torch.randn(B, 2 * (1 + 4), D)
-        out = tm.head(x)
+        out = tm.head(x, **_head_inputs())
         assert out.bbox.shape == (B, 2, 4)
 
     def test_all_task_shapes(self) -> None:
         """All 9 task modules produce correct output shapes."""
         n_inst = 2
         for tid, tdef in TASKS.items():
-            tm = TaskModule(n_keypoints=tdef.n_keypoints, d_model=D, n_inst=n_inst)
+            tm = make_task_module(tdef.n_keypoints, n_inst=n_inst)
             x = torch.randn(B, n_inst * (1 + tdef.n_keypoints), D)
-            out = tm.head(x)
+            out = tm.head(x, **_head_inputs())
             assert out.landmarks.shape == (B, n_inst, tdef.n_keypoints, 2), tid
 
 
 # ---------------------------------------------------------------------------
-# FUBioModel end-to-end (with stub backbone)
+# FUBioModel end-to-end (real constructor, stub backbone)
 # ---------------------------------------------------------------------------
 
 
-def _make_model() -> nn.Module:
-    from fubio.models.model import FUBioModel
-
-    model = FUBioModel.__new__(FUBioModel)
-    nn.Module.__init__(model)
-    # __init__ is bypassed above, so plain attributes it would set must be
-    # mirrored by hand. _geo=False selects the non-GeoSimCC path, which needs
-    # neither loc_k_proj nor the fine-detail stem. Keep in sync with
-    # FUBioModel.__init__ when it gains a new non-Module attribute.
-    model._geo = False
-    n_inst = 2
-    model.n_inst = n_inst
-    model.backbone = _StubBackbone()
-    model.neck = LinearNeck(C_BACKBONE, D)
-    model.decoder = CrossAttentionDecoder(d_model=D, n_heads=8, ffn_dim=1024, n_layers=2)
-    model.tasks = nn.ModuleDict(
-        {
-            tid: TaskModule(
-                n_keypoints=tdef.n_keypoints,
-                d_model=D,
-                n_inst=n_inst,
-            )
-            for tid, tdef in TASKS.items()
-        }
-    )
-    return model
-
-
 class TestFUBioModelForward:
-    def test_output_all_tasks(self) -> None:
-        model = _make_model()
+    def test_output_all_tasks(self, stub_backbone) -> None:
+        from conftest import make_module
+
+        model = make_module().model
         images = torch.randn(B, 3, 518, 518)
         model_out = model(images)
         task_outputs = model_out.task_outputs
@@ -279,21 +229,25 @@ class TestFUBioModelForward:
         for tid, out in task_outputs.items():
             K = TASKS[tid].n_keypoints
             assert isinstance(out, TaskOutput)
-            assert out.bbox.shape == (B, 2, 4)
-            assert out.conf.shape == (B, 2, 1)
-            assert out.landmarks.shape == (B, 2, K, 2)
+            assert out.bbox.shape == (B, 1, 4)
+            assert out.conf.shape == (B, 1, 1)
+            assert out.landmarks.shape == (B, 1, K, 2)
 
-    def test_bbox_normalized(self) -> None:
-        model = _make_model()
+    def test_bbox_normalized(self, stub_backbone) -> None:
+        from conftest import make_module
+
+        model = make_module().model
         images = torch.randn(B, 3, 518, 518)
         model_out = model(images)
         for out in model_out.task_outputs.values():
             assert out.bbox.min() >= 0.0
             assert out.bbox.max() <= 1.0
 
-    def test_gradient_flows(self) -> None:
+    def test_gradient_flows(self, stub_backbone) -> None:
         """Gradient flows from landmark output back through decoder."""
-        model = _make_model()
+        from conftest import make_module
+
+        model = make_module().model
         images = torch.randn(B, 3, 518, 518)
         model_out = model(images)
         loss = sum(out.landmarks.sum() for out in model_out.task_outputs.values())

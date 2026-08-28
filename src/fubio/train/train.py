@@ -188,18 +188,6 @@ def fit(
         VisualizationCallback(log_every_n_epochs=5),
     ]
 
-    if config.swad.enabled:
-        from fubio.train.callbacks import SWADCallback
-
-        callbacks.append(
-            SWADCallback(
-                n_converge=config.swad.n_converge,
-                n_tolerance=config.swad.n_tolerance,
-                tolerance_ratio=config.swad.tolerance_ratio,
-                start_after_epoch=config.swad.start_after_epoch,
-            )
-        )
-
     # Wandb logger — offline by default, sync later
     if wandb_offline:
         os.environ["WANDB_MODE"] = "offline"

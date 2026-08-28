@@ -1,4 +1,4 @@
-"""Produce submission.zip + viewer cache from a checkpoint (single model load).
+"""Produce submission.zip from a checkpoint (single model load).
 
 Usage:
     uv run python scripts/make_submission.py \\
@@ -14,7 +14,6 @@ Output:
     predictions/{tag}/regression_predictions.json  — evaluator reads this name
     predictions/{tag}/landmark_predictions.json    — docs spec this name
     predictions/{tag}/predictions_detail.json      — extended with confidence + GT
-    predictions/{tag}-all-instances.json            — viewer cache (all splits, all instances)
     predictions/SUBMISSION_LOG.md                   — appended template entry
 """
 
@@ -54,7 +53,6 @@ from fubio.serving.validate import (
     validate_inference_results,
     validate_submission_document,
 )
-from fubio.serving.viewer_export import generate_viewer_cache
 
 logger = logging.getLogger(__name__)
 
@@ -250,11 +248,6 @@ def main() -> None:
     parser.add_argument("--tag", required=True, help="Output tag (e.g. r21)")
     parser.add_argument("--data-root", default="data")
     parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument(
-        "--skip-viewer-cache",
-        action="store_true",
-        help="Skip generating the all-instances viewer cache",
-    )
     parser.add_argument(
         "--competition-ordering",
         action=argparse.BooleanOptionalAction,
@@ -467,23 +460,7 @@ def main() -> None:
     print(f"  → {zip_path}")
     print(f"{'=' * 60}")
 
-    # === Step 3: Viewer cache (reuses loaded model) ===
-    if not args.skip_viewer_cache:
-        cache_path = PROJECT_ROOT / "predictions" / f"{args.tag}-all-instances.json"
-        print(f"\n{'=' * 60}")
-        print(f"Step 3: Viewer cache → {cache_path}")
-        print(f"{'=' * 60}")
-        meta = generate_viewer_cache(
-            ckpt_path=ckpt,
-            data_root=args.data_root,
-            output_path=cache_path,
-            batch_size=args.batch_size,
-            module=module,
-            config=config,
-        )
-        print(f"  {meta['n_predictions']} predictions, {meta['elapsed_seconds']:.1f}s")
-
-    # === Step 4: Val-local ordering comparison ===
+    # === Step 3: Val-local ordering comparison ===
     if args.eval_local:
         print(f"\n{'=' * 60}")
         print("Step 4: Val-local CAN/COMP ordering comparison")
@@ -497,13 +474,12 @@ def main() -> None:
         table = eval_local_ordering(local_results, output_dir)
         print(table)
 
-    # === Step 5: Submission log ===
+    # === Step 4: Submission log ===
     _append_log(ckpt, args.tag, output_dir)
 
     print(f"\n{'=' * 60}")
     print("Done!")
     print(f"  Upload:  {zip_path}")
-    print("  Viewer:  uv run marimo edit notebooks/instance_viewer.py --host 0.0.0.0")
     print("  Log:     predictions/SUBMISSION_LOG.md (fill in scores after eval)")
     print(f"{'=' * 60}\n")
 

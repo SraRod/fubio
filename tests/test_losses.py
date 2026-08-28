@@ -17,11 +17,9 @@ from fubio.train.losses import (
     bbox_loss,
     chamber_angle_loss,
     conf_focal_loss,
-    conf_ranking_loss,
     ellipse_axis_ordering_loss,
     ellipse_orthogonality_loss,
     geometric_constraint_loss,
-    instance_repulsion_loss,
     landmark_loss,
     mil_loss,
     param_loss,
@@ -116,14 +114,14 @@ class TestLandmarkLoss:
         assert loss.item() == pytest.approx(0.0, abs=1e-6)
 
     def test_known_offset(self) -> None:
-        """Known displacement -> verify Huber value."""
+        """Known displacement -> verify plain L1 value."""
         N, K = 1, 1
         gt = torch.tensor([[[0.5, 0.5]]])
         pred = torch.tensor([[[0.5, 0.6]]])
         mask = torch.ones(N, K, dtype=torch.bool)
 
-        loss = landmark_loss(pred, gt, mask, beta=1.0)
-        expected = 0.5 * (0.1**2) / 1.0 / 2
+        loss = landmark_loss(pred, gt, mask)
+        expected = 0.1 / 2  # |Δy| averaged over the two coordinates
         assert loss.item() == pytest.approx(expected, abs=1e-5)
 
     def test_mask_exclusion(self) -> None:
@@ -159,19 +157,6 @@ class TestLandmarkLoss:
         loss_small = landmark_loss(pred_small, gt_small, mask_small)
         loss_large = landmark_loss(pred_large, gt_large, mask_large)
         assert loss_large.item() == pytest.approx(loss_small.item(), abs=1e-6)
-
-    def test_with_uncertainty(self) -> None:
-        """sigma provided -> GaussianNLL path produces finite loss."""
-        N, K = 3, 4
-        gt = torch.rand(N, K, 2)
-        pred = gt + 0.05
-        mask = torch.ones(N, K, dtype=torch.bool)
-        sigma = torch.ones(N, K, 2) * 0.01
-
-        loss = landmark_loss(pred, gt, mask, sigma=sigma)
-        assert torch.isfinite(loss)
-        loss_no_sigma = landmark_loss(pred, gt, mask)
-        assert loss.item() != pytest.approx(loss_no_sigma.item())
 
     def test_no_valid_landmarks(self) -> None:
         """All masked out -> loss = 0."""
@@ -337,101 +322,6 @@ class TestConfFocalLossLabelSmoothing:
 
 # =========================================================================
 # Confidence ranking loss
-# =========================================================================
-
-
-class TestConfRankingLoss:
-    """The loss that makes argmax(conf) agree with the matched query.
-
-    conf_focal_loss calibrates slots independently and leaves their ORDER free;
-    serving reads only the order, so it needs its own supervision.
-    """
-
-    def test_zero_when_matched_query_already_dominates(self) -> None:
-        logits = torch.tensor([[10.0, -10.0, -10.0, -10.0]])
-        loss = conf_ranking_loss(logits, [[0]])
-        assert loss.item() < 1e-3
-
-    def test_large_when_unmatched_query_outranks_matched(self) -> None:
-        """The exact failure mode measured on fetal_femur (argmax correct 46%)."""
-        logits = torch.tensor([[-10.0, 10.0, -10.0, -10.0]])
-        loss = conf_ranking_loss(logits, [[0]])
-        assert loss.item() > 10.0
-
-    def test_gradient_raises_matched_and_lowers_unmatched(self) -> None:
-        logits = torch.tensor([[0.0, 2.0, 0.0, 0.0]], requires_grad=True)
-        conf_ranking_loss(logits, [[0]]).backward()
-        grad = logits.grad[0]
-        assert grad[0] < 0, "matched slot should be pushed up"
-        assert grad[1] > 0, "the outranking unmatched slot should be pushed down"
-
-    def test_single_match_equals_cross_entropy(self) -> None:
-        """With one matched query the objective reduces exactly to CE."""
-        logits = torch.tensor([[0.3, -1.2, 2.0, 0.5]])
-        expected = torch.nn.functional.cross_entropy(logits, torch.tensor([2]))
-        assert torch.allclose(conf_ranking_loss(logits, [[2]]), expected, atol=1e-6)
-
-    def test_multi_match_does_not_rank_matched_against_each_other(self) -> None:
-        """Two genuine instances: swapping their logits must not change the loss."""
-        a = torch.tensor([[3.0, 1.0, -2.0, -2.0]])
-        b = torch.tensor([[1.0, 3.0, -2.0, -2.0]])
-        assert torch.allclose(
-            conf_ranking_loss(a, [[0, 1]]), conf_ranking_loss(b, [[0, 1]]), atol=1e-6
-        )
-
-    def test_images_without_gt_contribute_nothing(self) -> None:
-        logits = torch.randn(3, 4)
-        only_first = conf_ranking_loss(logits, [[0], [], []])
-        assert torch.allclose(only_first, conf_ranking_loss(logits[:1], [[0]]), atol=1e-6)
-
-    def test_no_matches_returns_zero(self) -> None:
-        assert conf_ranking_loss(torch.randn(2, 4), [[], []]).item() == 0.0
-
-
-# =========================================================================
-# Instance repulsion
-# =========================================================================
-
-
-class _FakeTaskOutput:
-    def __init__(self, bbox: torch.Tensor) -> None:
-        self.bbox = bbox
-
-
-class TestInstanceRepulsionMatchedDetach:
-    """The matched query must not be dragged away by a symmetric penalty."""
-
-    @staticmethod
-    def _boxes() -> torch.Tensor:
-        # Two overlapping slots so the penalty is non-zero and differentiable.
-        return torch.tensor([[[0.5, 0.5, 0.4, 0.4], [0.55, 0.55, 0.4, 0.4]]], requires_grad=True)
-
-    def test_without_matched_queries_all_slots_get_gradient(self) -> None:
-        box = self._boxes()
-        instance_repulsion_loss({"A4C": _FakeTaskOutput(box)}).backward()
-        assert box.grad[0, 0].abs().sum() > 0
-        assert box.grad[0, 1].abs().sum() > 0
-
-    def test_matched_slot_receives_no_gradient(self) -> None:
-        box = self._boxes()
-        instance_repulsion_loss(
-            {"A4C": _FakeTaskOutput(box)}, matched_queries={"A4C": [[0]]}
-        ).backward()
-        assert box.grad[0, 0].abs().sum() == 0, "matched slot must be detached"
-        assert box.grad[0, 1].abs().sum() > 0, "unmatched slot must still be pushed away"
-
-    def test_loss_value_unchanged_by_detaching(self) -> None:
-        """Detaching changes gradients only — the reported penalty is the same."""
-        box = self._boxes()
-        plain = instance_repulsion_loss({"A4C": _FakeTaskOutput(box)})
-        detached = instance_repulsion_loss(
-            {"A4C": _FakeTaskOutput(box)}, matched_queries={"A4C": [[0]]}
-        )
-        assert torch.allclose(plain, detached, atol=1e-6)
-
-
-# =========================================================================
-# Geometric constraint losses
 # =========================================================================
 
 

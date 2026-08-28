@@ -73,7 +73,7 @@ class TestTaskOutput:
         assert out.bbox.shape == (1, 2, 4)
         assert out.conf.shape == (1, 2, 1)
         assert out.landmarks.shape == (1, 2, 4, 2)
-        assert out.residual is None
+        assert out.heatmap is None
 
     def test_per_task_shapes(self) -> None:
         for tid, tdef in TASKS.items():

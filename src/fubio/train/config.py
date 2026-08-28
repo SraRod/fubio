@@ -23,100 +23,6 @@ from fubio.data.transforms import TransformConfig
 # ---------------------------------------------------------------------------
 
 
-class DirectCoordConfig(BaseModel, frozen=True, extra="forbid"):
-    """Direct regression: coords = sigmoid(coord_mlp(features))."""
-
-    mode: Literal["direct"] = "direct"
-
-
-class RefPointsCoordConfig(BaseModel, frozen=True, extra="forbid"):
-    """Learnable per-landmark bias: coords = sigmoid(mlp(feat) + ref_points)."""
-
-    mode: Literal["ref_points"] = "ref_points"
-
-
-class ShapePriorCoordConfig(BaseModel, frozen=True, extra="forbid"):
-    """PCA shape decomposition: coords = sigmoid(mean + α@basis + residual).
-
-    prior_path points to a shape_prior.json built by build_shape_prior.py.
-    """
-
-    mode: Literal["shape_prior"] = "shape_prior"
-    prior_path: Path = Path("data/shape_prior.json")
-    learnable_basis: bool = False
-
-
-class HeatmapCoordConfig(BaseModel, frozen=True, extra="forbid"):
-    """Spatially-grounded readout: coords = soft-argmax(softmax(q·memory / τ)).
-
-    No sigmoid — coords are a convex combination of grid positions, so range
-    is [0,1] by construction and edge landmarks stay reachable. Supervise the
-    heatmap with a Gaussian target (loss.lambda_heatmap) so the distribution
-    is single-peaked before soft-argmax reduces it — the three pieces
-    (affinity heatmap + Gaussian supervision + soft-argmax) are one unit.
-
-    gaussian_sigma is in patch-grid cells (not normalized units): σ scales with
-    grid resolution automatically.
-    """
-
-    mode: Literal["heatmap"] = "heatmap"
-    tau: float = 1.0  # softmax temperature; <1 sharpens the distribution
-    gaussian_sigma: float = 1.5  # target Gaussian width, in grid cells
-    # Bounded texture-driven sub-grid correction (P5 micro); macro stays heatmap's.
-    micro_residual: bool = False
-    micro_cells: float = 1.0  # residual bound, in grid cells (keeps correction sub-grid)
-    # Data positional prior: per-landmark log-Gaussian (μ_k, σ_k from labeled data)
-    # added to the affinity logits. Breaks cold-start collapse with zero tuning
-    # (μ/σ come from data). Requires shape_prior.json with mean_xy/std_xy.
-    data_prior: bool = False
-    # Per-instance prior dropout: probability of zeroing the entire Gaussian
-    # prior for a given instance during training. Forces visual-feature reliance
-    # instead of prior shortcut. 0.0 = always-on prior (backward compat).
-    prior_dropout: float = 0.0
-    # Add sinusoidal positional encoding to the heatmap attention KEYS.
-    # Introduced for ConvNeXtV2 (CNN features are translation-equivariant, so
-    # position must be injected explicitly) and left unconditional, which
-    # silently changed the DINOv2 path too — R15, the best online run, never had
-    # it. It makes logits = q·memory + q·pos, and the second term is independent
-    # of image content, stacking a second position-only additive term on top of
-    # data_prior. Default False = the R15 readout. Flip it deliberately, as an
-    # ablation, not as a side effect of backbone work.
-    use_memory_pos: bool = False
-
-
-class SimCCCoordConfig(BaseModel, frozen=True, extra="forbid"):
-    """[P2: SimCC readout] 1D coordinate classification with soft-argmax.
-
-    RTMPose pattern: project landmark features to independent x/y bin
-    distributions, Gaussian soft-label CE for training, soft-argmax (integral)
-    for sub-bin precision at inference.
-
-    n_bins = input_size × split_ratio (e.g. 224 × 2.0 = 448). Higher
-    split_ratio = finer resolution but more parameters in the output heads.
-    """
-
-    mode: Literal["simcc"] = "simcc"
-    split_ratio: float = 2.0
-    sigma_bins: float = 5.0  # Gaussian target width in bins
-
-
-class ShapeSimCCCoordConfig(BaseModel, frozen=True, extra="forbid"):
-    """PCA shape model + SimCC: structured coarse position biases 1D bins.
-
-    ShapePriorPredictor (mean + α@basis + residual) provides instance-adaptive
-    coarse coordinates; a Gaussian centered at that position biases SimCC bin
-    logits, pulling soft-argmax toward anatomically coherent predictions while
-    letting 1D bins refine each landmark independently.
-
-    Requires shape_prior.json (same as ShapePriorCoordConfig).
-    """
-
-    mode: Literal["shape_simcc"] = "shape_simcc"
-    split_ratio: float = 2.0
-    sigma_bins: float = 5.0
-    learnable_basis: bool = False
-
-
 class GeoSimCCCoordConfig(BaseModel, frozen=True, extra="forbid"):
     """Geometry locates, statistics shape, local evidence refines.
 
@@ -155,14 +61,10 @@ class GeoSimCCCoordConfig(BaseModel, frozen=True, extra="forbid"):
     d_local: int = 32
 
 
+# Kept as a one-member discriminated union: checkpoint hyper_parameters carry
+# {"mode": "geo_simcc", ...} and future readouts slot in as new members.
 CoordConfig = Annotated[
-    DirectCoordConfig
-    | RefPointsCoordConfig
-    | ShapePriorCoordConfig
-    | HeatmapCoordConfig
-    | SimCCCoordConfig
-    | ShapeSimCCCoordConfig
-    | GeoSimCCCoordConfig,
+    GeoSimCCCoordConfig,
     Field(discriminator="mode"),
 ]
 
@@ -205,37 +107,12 @@ class BackboneConfig(BaseModel, frozen=True):
 # ---------------------------------------------------------------------------
 
 
-class LinearNeckConfig(BaseModel, frozen=True):
-    """Single linear C_backbone → d_model. For flat-token backbones (DINOv2)."""
-
-    mode: Literal["linear"] = "linear"
-
-
-class FPNNeckConfig(BaseModel, frozen=True):
-    """Top-down FPN fusion of selected stages. For hierarchical backbones (ConvNeXtV2)."""
-
-    mode: Literal["fpn"] = "fpn"
-    stages: list[int] = [2, 3]
-
-
-class MultiLayerNeckConfig(BaseModel, frozen=True):
-    """Fuse features from multiple ViT blocks with learned weights.
-
-    Early blocks capture texture/edges, late blocks capture semantics. Softmax-
-    normalized weights let the model learn the optimal blend. For DINOv2 ViT-S/B
-    (12 blocks), [2, 5, 8, 11] samples evenly across depth.
-    """
-
-    mode: Literal["multi_layer"] = "multi_layer"
-    layer_indices: list[int] = [2, 5, 8, 11]
-
-
 class C2fNeckConfig(BaseModel, frozen=True):
     """C2f spatial fusion of multiple ViT blocks (RF-DETR pattern).
 
     Concat multi-layer features → C2f block (CSP bottleneck with 3x3 spatial
     convolutions) → d_model output. Cross-layer + cross-position nonlinear
-    fusion replaces the linear weighted sum of MultiLayerNeck.
+    fusion, in place of a linear per-layer weighted sum.
     """
 
     mode: Literal["c2f"] = "c2f"
@@ -243,8 +120,9 @@ class C2fNeckConfig(BaseModel, frozen=True):
     n_bottleneck: int = 2
 
 
+# One-member discriminated union, same rationale as CoordConfig above.
 NeckModeConfig = Annotated[
-    LinearNeckConfig | FPNNeckConfig | MultiLayerNeckConfig | C2fNeckConfig,
+    C2fNeckConfig,
     Field(discriminator="mode"),
 ]
 
@@ -278,9 +156,12 @@ class HeadConfig(BaseModel, frozen=True):
     n_inst: int = 2
     dropout: float = 0.1
     derive_bbox: bool = False
-    use_affine: bool = False
-    conf_mlp_layers: int = 1
-    coord: CoordConfig = Field(default_factory=DirectCoordConfig)
+    # Legacy keys, pinned to their disabled values: the AffineHead and the deep
+    # confidence MLP were removed after ablation, but checkpoint
+    # hyper_parameters still carry the fields.
+    use_affine: Literal[False] = False
+    conf_mlp_layers: Literal[1] = 1
+    coord: CoordConfig = Field(default_factory=GeoSimCCCoordConfig)
 
 
 class LossConfig(BaseModel, frozen=True):
@@ -298,26 +179,25 @@ class LossConfig(BaseModel, frozen=True):
 
     lambda_bbox: float = 1.0
     lambda_conf: float = 1.0
-    # L_conf_rank: listwise ranking so argmax(conf) picks the matched slot.
-    # lambda_conf calibrates each slot in isolation and leaves slot ORDER
-    # unconstrained, but order is the only thing serving uses.
-    lambda_conf_rank: float = 0.0
     lambda_land: float = 5.0
     lambda_param: float = 2.0
-    # 0.0 = pure L1, the submitted setting (paper Eq. 1); stage configs omit it.
-    landmark_beta: float = 0.0
-    # Rejected until a variance head is implemented — accepting it silently
-    # runs SmoothL1 while the config claims GaussianNLL.
-    use_uncertainty: bool = False
     neg_label_smooth: float = 0.0  # L_suppress: conf target for unmatched slots in labeled images
-    lambda_shape: float = 0.0  # L_shape: shape residual L2 reg; 0 = disabled
-    lambda_heatmap: float = 0.0  # L_heatmap: Gaussian target CE; 0 = disabled (heatmap mode only)
-    lambda_simcc: float = 0.0  # L_simcc: soft-label CE on 1D bins; 0 = disabled
-    lambda_shape_consistency: float = 0.0  # L_shape_cons: Procrustes subspace reg; 0 = disabled
-    lambda_ortho: float = 0.0  # L_ortho: soft orthogonality on AffineHead's 2×2 rotation submatrix
-    lambda_repulsion: float = 0.0  # L_repulsion: pairwise bbox IoU penalty across instance slots
-    lambda_supportive: float = 0.0  # weight on supportive landmark loss (scored=1.0); 0 = disabled
-    lambda_evidence: float = 0.0  # L_evidence: per-landmark evidence BCE; 0 = disabled
+    lambda_heatmap: float = 1.0  # L_heatmap: Gaussian target CE on GeoSimCC stage 1
+    lambda_shape_consistency: float = 0.0  # L_shape_cons: PCA subspace residual reg; 0 = disabled
+    # Legacy keys, pinned to their disabled values. The implementations were
+    # removed (falsified or superseded during the competition), but the
+    # submitted checkpoint's hyper_parameters carry every field below, so the
+    # names must stay accepted — and a config that tries to turn one back on
+    # must fail loudly instead of silently training without the term.
+    lambda_conf_rank: Literal[0.0] = 0.0
+    landmark_beta: Literal[0.0] = 0.0  # pure L1, the submitted setting (paper Eq. 1)
+    use_uncertainty: Literal[False] = False
+    lambda_shape: Literal[0.0] = 0.0
+    lambda_simcc: Literal[0.0] = 0.0
+    lambda_ortho: Literal[0.0] = 0.0
+    lambda_repulsion: Literal[0.0] = 0.0
+    lambda_supportive: Literal[0.0] = 0.0
+    lambda_evidence: Literal[0.0] = 0.0
     # L_geo: |compute_supportive(pred_scored) - GT_sup|; 0 = disabled
     lambda_geo_consistency: float = 0.0
     # L_geo_constraint: anatomical priors (ortho + axis order + chamber angle)
@@ -354,27 +234,23 @@ class OptimizerConfig(BaseModel, frozen=True):
 
 
 class MIROConfig(BaseModel, frozen=True):
-    """Mutual Information Regularization with Oracle (Round 2+).
+    """Legacy key. MIRO was removed after ablation; the submitted checkpoint's
+    hyper_parameters still carry this block (ExperimentConfig forbids unknown
+    top-level keys), so it stays accepted — pinned to its disabled values."""
 
-    lambda_miro=0.0 disables MIRO entirely; >0 activates it.
-    """
-
-    lambda_miro: float = 0.0
+    lambda_miro: Literal[0.0] = 0.0
     init_variance: float = 0.1
 
 
 class SWADConfig(BaseModel, frozen=True):
-    """SWAD: overfit-aware dense weight averaging (Cha et al., NeurIPS 2021).
+    """Legacy key. SWAD was removed after it regressed the prenatal tasks; the
+    key stays accepted for checkpoint hyper_parameters, pinned to disabled."""
 
-    enabled=False (default) disables SWAD. When enabled, LossValley
-    monitors val loss to select the averaging window automatically.
-    """
-
-    enabled: bool = False
+    enabled: Literal[False] = False
     n_converge: int = 3
     n_tolerance: int = 6
     tolerance_ratio: float = 0.3
-    start_after_epoch: int = 0  # delay past freeze→unfreeze transition
+    start_after_epoch: int = 0
 
 
 class SemiConfig(BaseModel, frozen=True):
@@ -562,68 +438,20 @@ class ExperimentConfig(BaseSettings, frozen=True):  # type: ignore[reportGeneral
 
     @model_validator(mode="after")
     def _default_neck(self) -> ExperimentConfig:
-        """Auto-select neck when not explicitly configured."""
+        """Default the neck when not explicitly configured."""
         if self.neck is None:
-            if "convnext" in self.backbone.name:
-                neck_cfg: LinearNeckConfig | FPNNeckConfig = FPNNeckConfig()
-            else:
-                neck_cfg = LinearNeckConfig()
-            object.__setattr__(self, "neck", neck_cfg)
+            object.__setattr__(self, "neck", C2fNeckConfig())
         return self
 
     @model_validator(mode="after")
-    def _validate_shape_loss(self) -> ExperimentConfig:
-        if self.loss.lambda_shape > 0 and not isinstance(self.head.coord, ShapePriorCoordConfig):
-            raise ValueError("lambda_shape > 0 requires coord.mode = 'shape_prior'")
-        # Both readouts emit a spatial distribution as TaskOutput.heatmap, so
-        # both are supervised through lambda_heatmap — but it means different
-        # things: for 'heatmap' it supervises the final coordinate, for
-        # 'geo_simcc' it supervises the stage-1 coarse locator only.
-        heat_modes = (HeatmapCoordConfig, GeoSimCCCoordConfig)
-        if self.loss.lambda_heatmap > 0 and not isinstance(self.head.coord, heat_modes):
-            raise ValueError("lambda_heatmap > 0 requires coord.mode = 'heatmap' or 'geo_simcc'")
-        # geo_simcc without it is a silent failure mode: stage 1 would be free to
-        # emit anything and let stages 2-3 compensate, which is the exact defect
-        # this readout exists to remove.
-        if isinstance(self.head.coord, GeoSimCCCoordConfig) and self.loss.lambda_heatmap <= 0:
+    def _validate_heatmap_supervision(self) -> ExperimentConfig:
+        # geo_simcc without lambda_heatmap is a silent failure mode: stage 1
+        # would be free to emit anything and let stages 2-3 compensate, which
+        # is the exact defect this readout exists to remove.
+        if self.loss.lambda_heatmap <= 0:
             raise ValueError(
                 "coord.mode = 'geo_simcc' requires lambda_heatmap > 0 — without it the "
                 "geometric coarse stage is unsupervised and the readout is pointless"
-            )
-        if self.loss.lambda_simcc > 0 and not isinstance(
-            self.head.coord, (SimCCCoordConfig, ShapeSimCCCoordConfig)
-        ):
-            raise ValueError("lambda_simcc > 0 requires coord.mode = 'simcc' or 'shape_simcc'")
-        if self.head.use_affine and isinstance(
-            self.head.coord, (SimCCCoordConfig, ShapeSimCCCoordConfig)
-        ):
-            raise ValueError(
-                "use_affine is incompatible with SimCC/ShapeSimCC: simcc_loss supervises "
-                "canonical logits in image space, forcing affine to identity. "
-                "use_affine is valid only with coord.mode='heatmap'."
-            )
-        if self.loss.lambda_ortho > 0 and not self.head.use_affine:
-            raise ValueError(
-                "lambda_ortho > 0 requires use_affine=true (ortho regularizes the affine head)"
-            )
-        return self
-
-    @model_validator(mode="after")
-    def _validate_uncertainty(self) -> ExperimentConfig:
-        if self.loss.use_uncertainty:
-            raise ValueError(
-                "use_uncertainty=True is not implemented: no variance head exists. "
-                "The flag is accepted for config compatibility but must remain False."
-            )
-        return self
-
-    @model_validator(mode="after")
-    def _validate_miro_multi_layer(self) -> ExperimentConfig:
-        _multi_layer = isinstance(self.neck, (MultiLayerNeckConfig, C2fNeckConfig))
-        if self.miro.lambda_miro > 0 and _multi_layer:
-            raise ValueError(
-                "MIRO and multi-layer/C2f neck require different intermediate "
-                "layer semantics and cannot be used together"
             )
         return self
 
