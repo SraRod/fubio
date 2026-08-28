@@ -15,6 +15,11 @@ data/cache
 data/images
 data/manifest.parquet
 data/Data
+data/val
+
+# Generated build context: docker/build_and_test.sh copies src/fubio here at
+# build time, so the image's package is always exactly the current source.
+docker/fubio/
 
 # Training / inference outputs
 wandb_logs/

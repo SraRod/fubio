@@ -54,40 +54,14 @@ class InferenceModule(nn.Module):
 
 
 def _load_shape_prior(config):
-    """Load shape prior following FUBioModule.__init__ logic."""
-    from fubio.train.config import (
-        GeoSimCCCoordConfig,
-        HeatmapCoordConfig,
-        ShapePriorCoordConfig,
-        ShapeSimCCCoordConfig,
-    )
+    """Load the shape prior following FUBioModule.__init__ logic: GeoSimCC's
+    SHAPE stage and the query anchors both need it."""
+    from fubio.data.shape_prior import ShapePrior
 
-    coord = config.head.coord
-    needs_prior = isinstance(
-        coord, (ShapePriorCoordConfig, ShapeSimCCCoordConfig, GeoSimCCCoordConfig)
-    ) or (isinstance(coord, HeatmapCoordConfig) and coord.data_prior)
-
-    shape_prior = None
-    if needs_prior:
-        from fubio.data.shape_prior import ShapePrior
-
-        prior_path = (
-            Path(coord.prior_path)
-            if isinstance(coord, ShapePriorCoordConfig)
-            else config.loss.shape_prior_path
-        )
-        if not prior_path.exists():
-            raise FileNotFoundError(f"Shape prior not found: {prior_path}")
-        shape_prior = ShapePrior.model_validate_json(prior_path.read_text())
-
-    if shape_prior is None:
-        from fubio.data.shape_prior import ShapePrior
-
-        anchor_path = config.loss.shape_prior_path
-        if anchor_path.exists():
-            shape_prior = ShapePrior.model_validate_json(anchor_path.read_text())
-
-    return shape_prior
+    prior_path = config.loss.shape_prior_path
+    if not prior_path.exists():
+        raise FileNotFoundError(f"Shape prior not found: {prior_path}")
+    return ShapePrior.model_validate_json(prior_path.read_text())
 
 
 def _file_sha256(path: Path) -> str:
