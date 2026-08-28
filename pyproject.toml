@@ -63,6 +63,15 @@ packages = ["src/fubio"]
 target-version = "py312"
 line-length = 100
 src = ["src", "tests"]
+# vendor_dinov2 is third-party vendored code; docker/fubio is assembled from
+# src/fubio by docker/build_and_test.sh. Neither is ours to lint.
+extend-exclude = ["docker/vendor_dinov2", "docker/fubio"]
+
+[tool.ruff.lint.per-file-ignores]
+# add_safe_globals must run before the Lightning imports that trigger torch.load
+"src/fubio/train/train.py" = ["E402"]
+# The organizers' entry script, kept byte-identical to the submitted container.
+"docker/predict.py" = ["E402"]
 
 [tool.ruff.lint]
 select = [

@@ -38,13 +38,26 @@ MANIFEST_PATH = Path("data/manifest.parquet")
 DATA_ROOT = Path("data")
 
 
+def _deep_update(base: dict, extra: dict) -> dict:
+    """Merge nested override dicts without wiping sibling keys.
+
+    A shallow ``dict.update`` would replace the whole ``optimizer`` block when
+    ``--epochs`` overrides only ``optimizer.max_epochs``.
+    """
+    for key, value in extra.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _deep_update(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
 def _ensure_split(
     manifest_path: Path,
     data_root: Path,
-    val_fraction: float,
     seed: int,
 ) -> None:
-    """Run DINOv2 diversity split if manifest lacks train_local/val_local."""
+    """Run the stratified split if the manifest lacks train_local/val_local."""
     df = pl.read_parquet(manifest_path)
     splits = set(df["split"].unique().to_list())
 
@@ -54,20 +67,15 @@ def _ensure_split(
         logger.info("Split already exists: train_local=%d, val_local=%d", n_train, n_val)
         return
 
-    logger.info("No train_local/val_local split found — running DINOv2 diversity split...")
-    from fubio.data.split import create_diversity_val_split
+    logger.info("No train_local/val_local split found — running stratified split...")
+    from fubio.data.split import _write_manifest, create_stratified_val_split
 
-    result, report = create_diversity_val_split(
-        df,
-        data_root=data_root,
-        val_fraction=val_fraction,
-        seed=seed,
-    )
-    result.write_parquet(manifest_path)
+    result, report = create_stratified_val_split(df, seed=seed)
+    _write_manifest(result, manifest_path)
 
     import json
 
-    report_path = data_root / "split_report.json"
+    report_path = data_root / "split_report_stratified.json"
     with open(report_path, "w") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
     logger.info("Split report saved: %s", report_path)
@@ -97,7 +105,7 @@ def fit(
         with open(config_path) as f:
             cfg_dict = yaml.safe_load(f) or {}
         if overrides:
-            cfg_dict.update(overrides)
+            _deep_update(cfg_dict, overrides)
         config = ExperimentConfig(**cfg_dict)
     else:
         config = ExperimentConfig(**(overrides or {}))
@@ -113,12 +121,7 @@ def fit(
 
     # Ensure train/val split exists (runs DINOv2 diversity split on first run)
     if not mock:
-        _ensure_split(
-            MANIFEST_PATH,
-            DATA_ROOT,
-            config.data.val_fraction,
-            config.seed,
-        )
+        _ensure_split(MANIFEST_PATH, DATA_ROOT, config.seed)
         # After _ensure_split, since that call can rewrite the manifest — the exact
         # sequence that silently invalidated the prior once already.
         from fubio.data.shape_prior import verify_shape_prior_provenance
@@ -255,12 +258,6 @@ if __name__ == "__main__":
         help="Cap train batches/epoch",
     )
     parser.add_argument(
-        "--val-fraction",
-        type=float,
-        default=None,
-        help="Override val split fraction",
-    )
-    parser.add_argument(
         "--ckpt",
         type=Path,
         default=None,
@@ -283,6 +280,11 @@ if __name__ == "__main__":
         default=None,
         help="Resume into existing wandb run ID",
     )
+    parser.add_argument(
+        "--wandb-offline",
+        action="store_true",
+        help="Log locally without a wandb account (sync later with `wandb sync`)",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
@@ -291,14 +293,13 @@ if __name__ == "__main__":
         overrides: dict = {}
         if args.epochs is not None:
             overrides["optimizer"] = {"max_epochs": args.epochs}
-        if args.val_fraction is not None:
-            overrides.setdefault("data", {})["val_fraction"] = args.val_fraction
         if args.benchmark:
             overrides["cudnn_benchmark"] = True
         fit(
             config_path=args.config,
             mock=args.mock,
             overrides=overrides or None,
+            wandb_offline=args.wandb_offline,
             limit_train_batches=args.limit_train_batches,
             ckpt_path=args.ckpt,
             wandb_run_id=args.wandb_id,

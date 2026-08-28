@@ -13,7 +13,10 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    import albumentations as A
 
 import numpy as np
 import torch

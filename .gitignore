@@ -14,3 +14,10 @@ __pycache__/
 data/cache
 data/images
 data/manifest.parquet
+data/Data
+
+# Training / inference outputs
+wandb_logs/
+predictions/
+checkpoints/
+.coverage

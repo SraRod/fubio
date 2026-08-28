@@ -1,0 +1,119 @@
+# Stage 2 — semi-supervised round 1 (paper Table 4, row 2; lineage run R47-semi).
+#
+# Initializes from the stage-1 (or stage-1b) checkpoint and adds the
+# EMA-teacher pseudo-label machinery of paper Section 2.6 over the ~191K
+# unlabeled images: teacher sees the clean view, the student a warped and
+# photometrically jittered one, and the unlabeled loss combines absence,
+# bag-level confidence (MIL), and confidence-weighted pseudo-label terms.
+# Pseudo-label weight ramps linearly over epochs 2-7; equivariance stays off
+# in this round (lambda_eq: 0). All nine task modules train.
+#
+#   python -m fubio.train.train fit --config configs/stage2.yaml \
+#       --init-weights <stage1 checkpoint>
+
+d_model: 512
+
+backbone:
+  name: dinov2_vitb14
+  pretrained: true
+  input_size: 518
+  freeze_epochs: 0
+
+neck:
+  mode: c2f
+  layer_indices: [2, 5, 8, 11]
+  n_bottleneck: 2
+
+neck_dropout: 0.1
+
+decoder:
+  n_layers: 3
+  n_heads: 8
+  ffn_dim: 4096
+  dropout: 0.1
+
+head:
+  n_layers: 1
+  ffn_dim: 2048
+  n_inst: 1
+  dropout: 0.1
+  derive_bbox: true
+  use_affine: false
+  coord:
+    mode: geo_simcc
+    tau: 1.0
+    window_cells: 1.0
+    n_offset_bins: 32
+    coarse_sigma_cells: 1.0
+    shape_weight: 0.5
+    d_local: 64
+
+matcher:
+  cost_conf: 1.0
+  cost_box: 5.0
+  cost_ciou: 2.0
+  cost_land: 10.0
+
+optimizer:
+  lr_backbone: 1.0e-5
+  lr_neck: 1.0e-4
+  lr_decoder: 1.0e-4
+  lr_heads: 1.0e-3
+  weight_decay: 0.05
+  warmup_steps: 500
+  max_epochs: 30
+  eta_min_ratio: 0.05
+  layer_decay: 0.75
+
+semi:
+  enabled: true
+  batch_size: 16
+  lambda_mil: 0.05
+  lambda_eq: 0.0
+  lambda_pseudo: 1.0
+  alpha_ema: 0.999
+  ramp_start: 2
+  ramp_end: 7
+  photo_brightness: 0.25
+  photo_contrast: 0.25
+  eq_rotation_range: 30.0
+  eq_scale_range: [0.8, 1.2]
+  eq_translate_range: 0.1
+
+loss:
+  lambda_bbox: 1.0
+  lambda_conf: 1.0
+  lambda_land: 5.0
+  lambda_param: 2.0
+  lambda_heatmap: 1.0
+  neg_label_smooth: 0.0
+  lambda_shape_consistency: 0.01
+  lambda_geo_consistency: 0.5
+  lambda_geo_constraint: 0.5
+  lambda_angle_sign: 0.1
+  shape_prior_path: data/shape_prior_v4.json
+
+data:
+  batch_size: 24
+  num_workers: 10
+  limit_train_batches: null
+  transform:
+    target_size: [518, 518]
+    rotation_range: 30.0
+    scale_range: [0.75, 1.25]
+    translate_range: 58.0
+    brightness_limit: 0.25
+    contrast_limit: 0.25
+    hflip_prob: 0.25
+    vflip_prob: 0.25
+  mosaic:
+    prob: 0.5
+    mode: distinct_task
+    close_epoch: 25
+  flip_close_epoch: 27
+
+logging:
+  project: fubio
+
+seed: 42
+precision: bf16-mixed

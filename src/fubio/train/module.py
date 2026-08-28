@@ -478,7 +478,9 @@ class FUBioModule(L.LightningModule):
         simcc_n_bins = 0
         simcc_sigma = 5.0
         if isinstance(self.config.head.coord, (SimCCCoordConfig, ShapeSimCCCoordConfig)):
-            simcc_n_bins = int(max(self.config.backbone.input_size) * self.config.head.coord.split_ratio)
+            simcc_n_bins = int(
+                max(self.config.backbone.input_size) * self.config.head.coord.split_ratio
+            )
             simcc_sigma = self.config.head.coord.sigma_bins
 
         # -- Supervision status per (image, task) --
@@ -929,7 +931,9 @@ class FUBioModule(L.LightningModule):
                 f"{stage}/loss_gc_chamber", total_gc_chamber_angle / gc_denom, sync_dist=sync,
             )
             if total_gc_angle_sign > 0:
-                self.log(f"{stage}/loss_gc_angle_sign", total_gc_angle_sign / gc_denom, sync_dist=sync)
+                self.log(
+                    f"{stage}/loss_gc_angle_sign", total_gc_angle_sign / gc_denom, sync_dist=sync
+                )
         if lambda_shape > 0:
             self.log(f"{stage}/loss_shape", total_shape, sync_dist=sync)
         if lambda_ortho > 0:

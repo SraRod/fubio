@@ -1,0 +1,113 @@
+# Stage 1b — optional surgical head-tune (paper Table 4, row 1; lineage run R47-head-tune).
+#
+# Use this only when stage 1 leaves individual task modules far behind the
+# rest — in the submitted lineage IVC and PSAX had collapsed (94 and 25 px
+# local validation error) while the other tasks were at their best. Everything
+# shared (backbone, neck, decoder, fine stem/proj) and the six healthy task
+# modules stay frozen; IVC and PSAX are reinitialized and retrained, A4C is
+# gently refined at 0.15x learning rate. `head_tune.tune_tasks` is the place
+# to name a different set of weak tasks.
+#
+# Skip this stage entirely if stage 1 comes out balanced. Stage 2 initializes
+# from whichever checkpoint you hand it.
+#
+#   python -m fubio.train.train fit --config configs/stage1-head-tune.yaml \
+#       --init-weights <stage1 checkpoint>
+
+d_model: 512
+
+backbone:
+  name: dinov2_vitb14
+  pretrained: true
+  input_size: 518
+  freeze_epochs: 0
+
+neck:
+  mode: c2f
+  layer_indices: [2, 5, 8, 11]
+  n_bottleneck: 2
+
+neck_dropout: 0.1
+
+decoder:
+  n_layers: 3
+  n_heads: 8
+  ffn_dim: 4096
+  dropout: 0.1
+
+head:
+  n_layers: 1
+  ffn_dim: 2048
+  n_inst: 1
+  dropout: 0.1
+  derive_bbox: true
+  use_affine: false
+  coord:
+    mode: geo_simcc
+    tau: 1.0
+    window_cells: 1.0
+    n_offset_bins: 32
+    coarse_sigma_cells: 1.0
+    shape_weight: 0.5
+    d_local: 64
+
+head_tune:
+  tune_tasks: [A4C, IVC, PSAX]
+  reinit_tasks: [IVC, PSAX]
+  lr_scale:
+    A4C: 0.15
+
+matcher:
+  cost_conf: 1.0
+  cost_box: 5.0
+  cost_ciou: 2.0
+  cost_land: 10.0
+
+optimizer:
+  lr_backbone: 1.0e-5
+  lr_neck: 1.0e-4
+  lr_decoder: 1.0e-4
+  lr_heads: 1.0e-3
+  weight_decay: 0.05
+  warmup_steps: 50
+  max_epochs: 50
+  eta_min_ratio: 0.05
+  layer_decay: 0.75
+
+loss:
+  lambda_bbox: 1.0
+  lambda_conf: 1.0
+  lambda_land: 5.0
+  lambda_param: 2.0
+  lambda_heatmap: 1.0
+  neg_label_smooth: 0.05
+  lambda_shape_consistency: 0.01
+  lambda_geo_consistency: 0.5
+  lambda_geo_constraint: 0.5
+  lambda_angle_sign: 0.5
+  shape_prior_path: data/shape_prior_v4.json
+
+data:
+  batch_size: 24
+  num_workers: 6
+  limit_train_batches: null
+  transform:
+    target_size: [518, 518]
+    rotation_range: 30.0
+    scale_range: [0.75, 1.25]
+    translate_range: 58.0
+    brightness_limit: 0.25
+    contrast_limit: 0.25
+    hflip_prob: 0.25
+    vflip_prob: 0.25
+  mosaic:
+    prob: 0.5
+    mode: distinct_task
+    close_epoch: 35
+  flip_close_epoch: 40
+
+logging:
+  project: fubio
+
+seed: 42
+precision: bf16-mixed

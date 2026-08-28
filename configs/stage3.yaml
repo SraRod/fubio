@@ -1,0 +1,141 @@
+# Stage 3 — semi-supervised round 2 (paper Table 4, row 3; lineage run R48-semi).
+#
+# Initializes from the stage-2 checkpoint. Changes against stage 2:
+#   - lambda_pseudo 1.0 -> 2.0: the round-1 teacher is stronger, distill harder.
+#   - lambda_eq 1.0 with its own ramp over epochs 7-12, starting only after
+#     the pseudo-label ramp (epochs 2-7) has reached full strength.
+#   - Wider, conservative scale augmentation for the six small-region tasks
+#     (both the labeled transform and the unlabeled equivariance warp).
+#   - fold_val_local: the 379-image local validation split joins training,
+#     so checkpoint selection falls back to unlabeled-loss statistics.
+#
+# The submitted checkpoint is epoch 007 of this run — inside the equivariance
+# ramp's dead zone, so the submitted weights received no equivariance gradient
+# (paper Section 2.6).
+#
+#   python -m fubio.train.train fit --config configs/stage3.yaml \
+#       --init-weights <stage2 checkpoint>
+
+d_model: 512
+
+backbone:
+  name: dinov2_vitb14
+  pretrained: true
+  input_size: 518
+  freeze_epochs: 0
+
+neck:
+  mode: c2f
+  layer_indices: [2, 5, 8, 11]
+  n_bottleneck: 2
+
+neck_dropout: 0.1
+
+decoder:
+  n_layers: 3
+  n_heads: 8
+  ffn_dim: 4096
+  dropout: 0.1
+
+head:
+  n_layers: 1
+  ffn_dim: 2048
+  n_inst: 1
+  dropout: 0.1
+  derive_bbox: true
+  use_affine: false
+  coord:
+    mode: geo_simcc
+    tau: 1.0
+    window_cells: 1.0
+    n_offset_bins: 32
+    coarse_sigma_cells: 1.0
+    shape_weight: 0.5
+    d_local: 64
+
+matcher:
+  cost_conf: 1.0
+  cost_box: 5.0
+  cost_ciou: 2.0
+  cost_land: 10.0
+
+optimizer:
+  lr_backbone: 1.0e-5
+  lr_neck: 1.0e-4
+  lr_decoder: 1.0e-4
+  lr_heads: 1.0e-3
+  weight_decay: 0.05
+  warmup_steps: 500
+  max_epochs: 15
+  eta_min_ratio: 0.05
+  layer_decay: 0.75
+
+semi:
+  enabled: true
+  batch_size: 16
+  lambda_mil: 0.05
+  lambda_eq: 1.0
+  lambda_pseudo: 2.0
+  alpha_ema: 0.999
+  ramp_start: 2
+  ramp_end: 7
+  eq_ramp_start: 7
+  eq_ramp_end: 12
+  eq_rotation_range: 30.0
+  eq_scale_range: [0.8, 1.2]
+  eq_translate_range: 0.1
+  task_eq_scale_override:
+    IVC: [0.65, 1.5]
+    PSAX: [0.65, 1.5]
+    fetal_femur: [0.65, 1.5]
+    FUGC: [0.65, 1.5]
+    PLAX: [0.65, 1.5]
+    HC: [0.65, 1.35]
+  photo_brightness: 0.25
+  photo_contrast: 0.25
+
+loss:
+  lambda_bbox: 1.0
+  lambda_conf: 1.0
+  lambda_land: 5.0
+  lambda_param: 2.0
+  lambda_heatmap: 1.0
+  neg_label_smooth: 0.0
+  lambda_shape_consistency: 0.01
+  lambda_geo_consistency: 0.5
+  lambda_geo_constraint: 0.5
+  lambda_angle_sign: 0.1
+  shape_prior_path: data/shape_prior_v4.json
+
+data:
+  batch_size: 24
+  num_workers: 10
+  limit_train_batches: null
+  fold_val_local: true
+  transform:
+    target_size: [518, 518]
+    rotation_range: 30.0
+    scale_range: [0.75, 1.25]
+    task_scale_override:
+      IVC: [0.65, 1.5]
+      PSAX: [0.65, 1.5]
+      fetal_femur: [0.65, 1.5]
+      FUGC: [0.65, 1.5]
+      PLAX: [0.65, 1.5]
+      HC: [0.65, 1.35]
+    translate_range: 58.0
+    brightness_limit: 0.25
+    contrast_limit: 0.25
+    hflip_prob: 0.25
+    vflip_prob: 0.25
+  mosaic:
+    prob: 0.5
+    mode: distinct_task
+    close_epoch: 12
+  flip_close_epoch: 13
+
+logging:
+  project: fubio
+
+seed: 42
+precision: bf16-mixed

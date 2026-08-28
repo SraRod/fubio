@@ -33,6 +33,7 @@ Usage:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import time
@@ -332,7 +333,12 @@ def create_stratified_val_split(
         group_sizes = dict(task_df.group_by("group_id").len().rename({"len": "n"}).iter_rows())
         strata = _group_strata(task_df, n_bins)
 
-        rng = np.random.default_rng([seed, abs(hash(task_id)) % (2**31)])
+        # Stable per-task stream: builtin hash() is randomized per process
+        # (PYTHONHASHSEED), which made --seed alone non-reproducible.
+        task_digest = int.from_bytes(
+            hashlib.blake2b(task_id.encode(), digest_size=4).digest(), "big"
+        )
+        rng = np.random.default_rng([seed, task_digest])
         val_groups = set(_select_val_groups(strata, group_sizes, target, rng))
         val_paths.update(
             task_df.filter(pl.col("group_id").is_in(val_groups))["image_path"].to_list()

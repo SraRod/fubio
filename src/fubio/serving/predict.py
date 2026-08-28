@@ -27,8 +27,12 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from fubio.train.module import FUBioModule
 
 import cv2
 import numpy as np
@@ -1249,7 +1253,7 @@ def main() -> None:
         "input_size": input_size,
         "mode": args.mode,
         "data_root": str(data_root),
-        "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+        "timestamp": datetime.now(tz=UTC).isoformat(),
         "n_predictions": len(results),
     }
     save_outputs(
